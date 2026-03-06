@@ -1,0 +1,5 @@
+Fault tolerance ensures training continues despite failures
+Worker heartbeats detect crashed nodes in the cluster
+gRPC enables efficient remote procedure calls between services
+Protocol buffers serialize structured data for network transfer
+Load balancing distributes work evenly across available resources

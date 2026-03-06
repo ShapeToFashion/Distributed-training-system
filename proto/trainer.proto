@@ -1,0 +1,131 @@
+// trainer.proto
+//
+// This file defines the gRPC communication protocol between Master and Workers.
+//
+// HOW gRPC WORKS:
+// ────────────────
+// gRPC uses Protocol Buffers (protobuf) to define:
+//   1. Services  → What functions can be called remotely (like an API)
+//   2. Messages  → What data is sent/received (like JSON but binary & faster)
+//
+// The `protoc` compiler reads this file and generates Go code that handles
+// all the networking, serialization, and deserialization automatically.
+//
+// ARCHITECTURE:
+// ────────────────
+//   Worker ──── gRPC ────► Master
+//
+//   Workers CALL these methods on the master:
+//     RegisterWorker  → "Hey master, I'm alive, add me to the cluster"
+//     SendHeartbeat   → "I'm still alive" (every 5 seconds)
+//     SendGradients   → "Here are my computed gradients from training"
+//     GetWeights      → "Give me the latest model weights"
+
+syntax = "proto3";
+
+package trainer;
+
+// go_package tells protoc where to put the generated Go code
+option go_package = "./proto";
+
+// ─────────────────────────────────────────────────
+// SERVICE DEFINITION
+// ─────────────────────────────────────────────────
+// This is like defining an interface/API.
+// Each rpc is a function that a worker can call on the master.
+
+service TrainerService {
+
+  // Worker calls this ONCE at startup to join the cluster
+  rpc RegisterWorker(RegisterRequest) returns (RegisterResponse);
+
+  // Worker calls this every 5 seconds so master knows it's alive
+  rpc SendHeartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Worker sends computed gradients after training a batch
+  rpc SendGradients(GradientRequest) returns (GradientResponse);
+
+  // Worker requests latest model weights from master
+  rpc GetWeights(WeightsRequest) returns (WeightsResponse);
+
+  // Master assigns a training task (data shard) to a worker
+  // Worker calls this to poll for new tasks
+  rpc GetTask(TaskRequest) returns (TaskResponse);
+
+  // Master saves/loads model checkpoints
+  rpc SaveCheckpoint(CheckpointRequest) returns (CheckpointResponse);
+}
+
+// ─────────────────────────────────────────────────
+// MESSAGES (Data structures sent over the network)
+// ─────────────────────────────────────────────────
+// Each field has a type and a unique number (1, 2, 3...).
+// The numbers are used internally by protobuf for efficient encoding.
+// "repeated" means it's a list/array.
+
+// ── Worker Registration ──
+
+message RegisterRequest {
+  string worker_id = 1;   // Unique ID like "worker1", "worker2"
+  string address = 2;     // IP/hostname of the worker
+}
+
+message RegisterResponse {
+  string status = 1;      // "registered" if successful
+}
+
+// ── Heartbeat (Keep-Alive) ──
+
+message HeartbeatRequest {
+  string worker_id = 1;   // Which worker is sending the heartbeat
+}
+
+message HeartbeatResponse {
+  string status = 1;      // "alive" acknowledgment
+}
+
+// ── Gradient Communication ──
+
+message GradientRequest {
+  string worker_id = 1;          // Which worker computed these gradients
+  repeated float gradients = 2;  // The gradient vector (list of floats)
+}
+
+message GradientResponse {
+  string status = 1;             // "received" acknowledgment
+}
+
+// ── Weight Distribution ──
+
+message WeightsRequest {
+  // Empty — worker just asks "give me weights"
+}
+
+message WeightsResponse {
+  repeated float weights = 1;    // The full model weight vector
+}
+
+// ── Task Assignment ──
+
+message TaskRequest {
+  string worker_id = 1;         // Which worker is asking for a task
+}
+
+message TaskResponse {
+  string shard_path = 1;        // Path to the data shard file
+  int32 batch_size = 2;         // How many samples per training batch
+  float learning_rate = 3;      // Learning rate for gradient descent
+  int32 epoch = 4;              // Current training epoch number
+  bool has_task = 5;            // False if no task available (training done)
+}
+
+// ── Checkpointing ──
+
+message CheckpointRequest {
+  int32 step = 1;               // Training step number
+}
+
+message CheckpointResponse {
+  string status = 1;            // "saved" or error message
+  string path = 2;              // Where the checkpoint was saved
+}

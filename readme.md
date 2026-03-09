@@ -47,9 +47,11 @@ storage/            Model checkpoints (Step 9)
 ## Prerequisites
 
 ### 1. Install Go
+
 Download and install Go (1.25+): https://go.dev/dl/
 
 Verify:
+
 ```bash
 go version
 ```
@@ -57,6 +59,7 @@ go version
 ### 2. Install Protocol Buffers Compiler (protoc)
 
 **Windows:**
+
 ```bash
 # Using Chocolatey
 choco install protobuf
@@ -67,16 +70,19 @@ choco install protobuf
 ```
 
 **macOS:**
+
 ```bash
 brew install protobuf
 ```
 
 **Linux (Ubuntu/Debian):**
+
 ```bash
 sudo apt install -y protobuf-compiler
 ```
 
 Verify:
+
 ```bash
 protoc --version
 ```
@@ -89,6 +95,7 @@ go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
 ```
 
 Make sure `$GOPATH/bin` (or `%GOPATH%\bin` on Windows) is in your PATH:
+
 ```bash
 # Linux/macOS — add to ~/.bashrc or ~/.zshrc
 export PATH="$PATH:$(go env GOPATH)/bin"
@@ -98,6 +105,7 @@ $env:PATH += ";$(go env GOPATH)\bin"
 ```
 
 ### 4. Install Python (for training scripts)
+
 Download Python 3.10+: https://www.python.org/downloads/
 
 ---
@@ -110,6 +118,7 @@ cd Distributed-training-system
 ```
 
 ### Install Go Dependencies
+
 ```bash
 go mod tidy
 ```
@@ -125,6 +134,7 @@ protoc --go_out=. --go_opt=paths=source_relative \
 ```
 
 This generates:
+
 - `proto/trainer.pb.go` — message serialization code
 - `proto/trainer_grpc.pb.go` — gRPC client/server stubs
 
@@ -137,6 +147,7 @@ This generates:
 ```bash
 go run master/gradient_server.go master/worker_manager.go master/schedule.go
 ```
+
 Master listens on **port 50051**.
 
 **Terminal 2 — Start Worker 1:**
@@ -158,18 +169,22 @@ go run worker/worker.go worker/heartbeat.go -id=worker2
 ### Machine A (Master)
 
 1. Master IP (Kartik's machine):
+
    ```
    IPv4 Address: 10.56.89.116
    Port: 50051
    ```
 
 2. Start the master:
+
    ```bash
    go run master/gradient_server.go master/worker_manager.go master/schedule.go
    ```
+
    Master will listen on `0.0.0.0:50051` (all interfaces).
 
 3. **Open firewall for port 50051:**
+
    ```bash
    # Windows (run as Administrator)
    netsh advfirewall firewall add rule name="gRPC Master" dir=in action=allow protocol=TCP localport=50051
@@ -181,6 +196,7 @@ go run worker/worker.go worker/heartbeat.go -id=worker2
 ### Machine B (Worker)
 
 1. Clone the repo and install dependencies:
+
    ```bash
    git clone https://github.com/ShapeToFashion/Distributed-training-system.git
    cd Distributed-training-system
@@ -197,6 +213,7 @@ go run worker/worker.go worker/heartbeat.go -id=worker2
 ```bash
 go run worker/worker.go worker/heartbeat.go -id=test-worker -master=10.56.89.116:50051 -test
 ```
+
 This registers with the master and exits — useful to verify the gRPC link works.
 
 ---
@@ -205,14 +222,14 @@ This registers with the master and exits — useful to verify the gRPC link work
 
 Defined in `proto/trainer.proto`:
 
-| RPC Method         | Direction        | Purpose                                   |
-|--------------------|------------------|-------------------------------------------|
-| `RegisterWorker`   | Worker → Master  | Worker joins the cluster                  |
-| `SendHeartbeat`    | Worker → Master  | Keep-alive ping (every 5s)                |
-| `GetTask`          | Worker → Master  | Worker polls for a training task (shard)  |
-| `GetWeights`       | Worker → Master  | Worker fetches latest model weights       |
-| `SendGradients`    | Worker → Master  | Worker sends computed gradients           |
-| `SaveCheckpoint`   | Internal         | Master saves model checkpoint to disk     |
+| RPC Method       | Direction       | Purpose                                  |
+| ---------------- | --------------- | ---------------------------------------- |
+| `RegisterWorker` | Worker → Master | Worker joins the cluster                 |
+| `SendHeartbeat`  | Worker → Master | Keep-alive ping (every 5s)               |
+| `GetTask`        | Worker → Master | Worker polls for a training task (shard) |
+| `GetWeights`     | Worker → Master | Worker fetches latest model weights      |
+| `SendGradients`  | Worker → Master | Worker sends computed gradients          |
+| `SaveCheckpoint` | Internal        | Master saves model checkpoint to disk    |
 
 **Default port:** `50051`
 
@@ -220,9 +237,27 @@ Defined in `proto/trainer.proto`:
 
 ## Troubleshooting
 
-| Problem | Fix |
-|---------|-----|
-| `connection refused` | Check master is running and IP/port are correct |
+| Problem                            | Fix                                                                  |
+| ---------------------------------- | -------------------------------------------------------------------- |
+| `connection refused`               | Check master is running and IP/port are correct                      |
+| `context deadline exceeded`        | Firewall may be blocking port 50051                                  |
+| `protoc-gen-go: program not found` | Run `go install` commands above and add GOPATH/bin to PATH           |
+| `module not found` errors          | Run `go mod tidy` in the project root                                |
+| Workers disconnect                 | Check heartbeat logs; master marks workers dead after 15s of silence |
+
+---
+
+## Development Progress
+
+- [x] Step 1: gRPC protocol definition
+- [x] Step 2: Master server
+- [x] Step 3: Worker node
+- [x] Step 4: Worker registration
+- [x] Step 5: Heartbeat system
+- [ ] Step 6: Dataset distribution
+- [ ] Step 7: Training execution
+- [ ] Step 8: Gradient aggregation
+- [ ] Step 9: Checkpointingeck master is running and IP/port are correct |
 | `context deadline exceeded` | Firewall may be blocking port 50051 |
 | `protoc-gen-go: program not found` | Run `go install` commands above and add GOPATH/bin to PATH |
 | `module not found` errors | Run `go mod tidy` in the project root |

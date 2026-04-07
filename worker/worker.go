@@ -40,6 +40,16 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+func pythonExecutable() string {
+	if p, err := exec.LookPath("python3"); err == nil {
+		return p
+	}
+	if p, err := exec.LookPath("python"); err == nil {
+		return p
+	}
+	return "python"
+}
+
 // TrainResult holds the JSON output from the Python training script.
 type TrainResult struct {
 	Gradients     []float32 `json:"gradients"`
@@ -117,7 +127,11 @@ func main() {
 
 		// 4c) Save weights to temp file for Python to read
 		weightsFile := filepath.Join(os.TempDir(), fmt.Sprintf("weights_%s.json", *workerID))
-		weightsJSON, _ := json.Marshal(weightsResp.Weights)
+		weightsJSON, err := json.Marshal(weightsResp.Weights)
+		if err != nil {
+			fmt.Printf("[WORKER %s] Failed to marshal weights: %v\n", *workerID, err)
+			continue
+		}
 		if err := os.WriteFile(weightsFile, weightsJSON, 0600); err != nil {
 			fmt.Printf("[WORKER %s] Failed to write weights file: %v\n", *workerID, err)
 			continue
@@ -139,6 +153,7 @@ func main() {
 		_, err = client.SendGradients(context.Background(), &pb.GradientRequest{
 			WorkerId:  *workerID,
 			Gradients: gradients,
+			Loss:      loss,
 		})
 		if err != nil {
 			fmt.Printf("[WORKER %s] SendGradients error: %v\n", *workerID, err)
@@ -162,7 +177,7 @@ func main() {
 // trains, and writes gradients as JSON to stdout.
 func runPythonTrainer(shardPath string, batchSize int, lr float32, weightsFile string) ([]float32, float64, error) {
 	cmd := exec.Command(
-		"python",
+		pythonExecutable(),
 		"training/train.py",
 		fmt.Sprintf("--data=%s", shardPath),
 		fmt.Sprintf("--batch_size=%d", batchSize),

@@ -26,13 +26,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"strconv"
 	"strings"
 )
 
 // Checkpoint holds the model state at a given training step.
 type Checkpoint struct {
 	Step    int       `json:"step"`
+	Epoch   int       `json:"epoch"`
 	Weights []float32 `json:"weights"`
 	Loss    float64   `json:"loss"`
 }
@@ -41,7 +42,7 @@ type Checkpoint struct {
 //
 // File format: storage/checkpoint_step_500.json
 // Content: JSON with step number, weights array, and loss value.
-func SaveCheckpoint(dir string, step int, weights []float32, loss float64) (string, error) {
+func SaveCheckpoint(dir string, step int, epoch int, weights []float32, loss float64) (string, error) {
 	// Create directory if it doesn't exist
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return "", fmt.Errorf("failed to create checkpoint dir: %w", err)
@@ -52,6 +53,7 @@ func SaveCheckpoint(dir string, step int, weights []float32, loss float64) (stri
 
 	ckpt := Checkpoint{
 		Step:    step,
+		Epoch:   epoch,
 		Weights: weights,
 		Loss:    loss,
 	}
@@ -79,21 +81,32 @@ func LoadLatestCheckpoint(dir string) (*Checkpoint, error) {
 		return nil, fmt.Errorf("no checkpoint directory: %w", err)
 	}
 
-	// Find all checkpoint files
-	var checkpointFiles []string
+	// Find checkpoint files and pick the highest step (numeric, not lexicographic).
+	var latestFile string
+	var latestStep int
+	found := false
+	prefix := "checkpoint_step_"
+	suffix := ".json"
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "checkpoint_step_") && strings.HasSuffix(e.Name(), ".json") {
-			checkpointFiles = append(checkpointFiles, e.Name())
+		name := e.Name()
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+			continue
+		}
+		mid := strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix)
+		step, err := strconv.Atoi(mid)
+		if err != nil {
+			continue
+		}
+		if !found || step > latestStep {
+			found = true
+			latestStep = step
+			latestFile = name
 		}
 	}
 
-	if len(checkpointFiles) == 0 {
+	if !found {
 		return nil, fmt.Errorf("no checkpoints found in %s", dir)
 	}
-
-	// Sort to get the latest (highest step number last)
-	sort.Strings(checkpointFiles)
-	latestFile := checkpointFiles[len(checkpointFiles)-1]
 	path := filepath.Join(dir, latestFile)
 
 	data, err := os.ReadFile(path)

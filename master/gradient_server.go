@@ -75,6 +75,7 @@ type MasterServer struct {
 	// Once ALL alive workers have sent gradients, the master averages
 	// them and updates the weights.
 	gradientBuffer map[string][]float32 // worker_id → gradients
+	lossBuffer     map[string]float64   // worker_id → batch loss (cleared each aggregate step)
 	gradientCount  int                  // How many workers have sent gradients this step
 
 	// ── Training state ──
@@ -103,6 +104,7 @@ func NewMasterServer(config TrainingConfig) *MasterServer {
 		workers:          make(map[string]*WorkerInfo),
 		weights:          weights,
 		gradientBuffer:   make(map[string][]float32),
+		lossBuffer:       make(map[string]float64),
 		config:           config,
 		shardAssignments: make(map[string]string),
 	}
@@ -207,8 +209,9 @@ func (m *MasterServer) SendGradients(ctx context.Context, req *pb.GradientReques
 
 	fmt.Printf("[MASTER] Received gradients from %s (size: %d)\n", req.WorkerId, len(req.Gradients))
 
-	// Store this worker's gradients
+	// Store this worker's gradients and loss
 	m.gradientBuffer[req.WorkerId] = req.Gradients
+	m.lossBuffer[req.WorkerId] = req.GetLoss()
 	m.gradientCount++
 
 	// Count how many alive workers we expect gradients from
@@ -264,6 +267,15 @@ func (m *MasterServer) aggregateAndUpdate() {
 		m.weights[i] -= lr * avgGrad[i]
 	}
 
+	if len(m.lossBuffer) > 0 {
+		var lossSum float64
+		for _, v := range m.lossBuffer {
+			lossSum += v
+		}
+		m.totalLoss += lossSum / float64(len(m.lossBuffer))
+		m.lossCount++
+	}
+
 	m.currentStep++
 	fmt.Printf("[MASTER] ✓ Step %d complete. Weights updated. (epoch %d)\n", m.currentStep, m.currentEpoch)
 
@@ -273,7 +285,7 @@ func (m *MasterServer) aggregateAndUpdate() {
 		if m.lossCount > 0 {
 			avgLoss = m.totalLoss / float64(m.lossCount)
 		}
-		_, err := storage.SaveCheckpoint("storage", m.currentStep, m.weights, avgLoss)
+		_, err := storage.SaveCheckpoint("storage", m.currentStep, m.currentEpoch, m.weights, avgLoss)
 		if err != nil {
 			fmt.Printf("[MASTER] Checkpoint error: %v\n", err)
 		}
@@ -293,12 +305,13 @@ func (m *MasterServer) aggregateAndUpdate() {
 			if m.lossCount > 0 {
 				avgLoss = m.totalLoss / float64(m.lossCount)
 			}
-			storage.SaveCheckpoint("storage", m.currentStep, m.weights, avgLoss)
+			storage.SaveCheckpoint("storage", m.currentStep, m.currentEpoch, m.weights, avgLoss)
 		}
 	}
 
 	// Reset gradient buffer for next step
 	m.gradientBuffer = make(map[string][]float32)
+	m.lossBuffer = make(map[string]float64)
 	m.gradientCount = 0
 }
 
@@ -328,7 +341,7 @@ func (m *MasterServer) SaveCheckpoint(ctx context.Context, req *pb.CheckpointReq
 		avgLoss = m.totalLoss / float64(m.lossCount)
 	}
 
-	path, err := storage.SaveCheckpoint("storage", int(req.Step), m.weights, avgLoss)
+	path, err := storage.SaveCheckpoint("storage", int(req.Step), m.currentEpoch, m.weights, avgLoss)
 	if err != nil {
 		return &pb.CheckpointResponse{Status: "error: " + err.Error()}, nil
 	}
@@ -350,19 +363,9 @@ func (m *MasterServer) StartHealthChecker() {
 				if time.Since(w.LastHeartbeat) > 15*time.Second && w.IsAlive {
 					w.IsAlive = false
 					fmt.Printf("[MASTER] ⚠ Worker %s is DEAD (no heartbeat)\n", id)
-
-					// Reassign dead worker's shard to another alive worker
-					if deadShard, ok := m.shardAssignments[id]; ok {
-						for otherID, otherW := range m.workers {
-							if otherW.IsAlive && otherID != id {
-								m.shardAssignments[otherID] = deadShard
-								fmt.Printf("[MASTER] Reassigned shard %s → %s\n", deadShard, otherID)
-								break
-							}
-						}
-					}
 				}
 			}
+			m.reassignDeadWorkerShardsLocked()
 			m.mu.Unlock()
 		}
 	}()
@@ -388,7 +391,7 @@ func (m *MasterServer) SaveWeightsToFile(path string) error {
 func main() {
 	// Training configuration
 	config := TrainingConfig{
-		NumEpochs:          3,    // 3 passes over the dataset
+		NumEpochs:          20,    // 20 passes over the dataset
 		BatchSize:          4,    // 4 lines per training batch
 		LearningRate:       0.01, // Step size for weight updates
 		CheckpointInterval: 5,    // Save every 5 steps
@@ -408,6 +411,7 @@ func main() {
 		master = NewMasterServer(config)
 		master.weights = ckpt.Weights
 		master.currentStep = ckpt.Step
+		master.currentEpoch = ckpt.Epoch
 	} else {
 		master = NewMasterServer(config)
 		fmt.Println("[MASTER] Starting fresh (no checkpoint found)")

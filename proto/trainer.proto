@@ -89,6 +89,7 @@ message HeartbeatResponse {
 message GradientRequest {
   string worker_id = 1;          // Which worker computed these gradients
   repeated float gradients = 2;  // The gradient vector (list of floats)
+  double loss = 3;               // Training loss for this worker's batch (master averages across workers)
 }
 
 message GradientResponse {

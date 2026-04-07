@@ -38,31 +38,31 @@ func (m *MasterServer) GetShardAssignments() []ShardAssignment {
 	return assignments
 }
 
+// reassignDeadWorkerShardsLocked gives each dead worker's shard to the first alive worker.
+// Caller must hold m.mu.
+func (m *MasterServer) reassignDeadWorkerShardsLocked() {
+	for id, w := range m.workers {
+		if w.IsAlive {
+			continue
+		}
+		deadShard, ok := m.shardAssignments[id]
+		if !ok || deadShard == "" {
+			continue
+		}
+		for otherID, otherW := range m.workers {
+			if otherW.IsAlive && otherID != id {
+				m.shardAssignments[otherID] = deadShard
+				fmt.Printf("[MASTER] Reassigned shard %s → %s (from dead worker %s)\n", deadShard, otherID, id)
+				break
+			}
+		}
+	}
+}
+
 // ReassignDeadWorkerShards takes shards from dead workers and gives them
 // to alive workers. Called during failure recovery.
 func (m *MasterServer) ReassignDeadWorkerShards() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	var aliveWorkers []string
-	for id, w := range m.workers {
-		if w.IsAlive {
-			aliveWorkers = append(aliveWorkers, id)
-		}
-	}
-
-	if len(aliveWorkers) == 0 {
-		fmt.Println("[SCHEDULER] No alive workers for reassignment!")
-		return
-	}
-
-	idx := 0
-	for id, w := range m.workers {
-		if !w.IsAlive && w.AssignedShard != "" {
-			newWorker := aliveWorkers[idx%len(aliveWorkers)]
-			m.shardAssignments[newWorker] = w.AssignedShard
-			fmt.Printf("[SCHEDULER] Reassigned %s: %s → %s\n", w.AssignedShard, id, newWorker)
-			idx++
-		}
-	}
+	m.reassignDeadWorkerShardsLocked()
 }

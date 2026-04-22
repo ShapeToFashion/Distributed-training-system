@@ -1,12 +1,10 @@
 // worker_manager.go
 //
 // PURPOSE: Utility functions for worker management and cluster monitoring.
-
 package main
 
 import "fmt"
 
-// PrintClusterStatus prints a human-readable summary of the cluster.
 func (m *MasterServer) PrintClusterStatus() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -30,7 +28,6 @@ func (m *MasterServer) PrintClusterStatus() {
 	fmt.Println("══════════════════════")
 }
 
-// GetAliveWorkerIDs returns the IDs of all workers currently alive.
 func (m *MasterServer) GetAliveWorkerIDs() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -44,7 +41,6 @@ func (m *MasterServer) GetAliveWorkerIDs() []string {
 	return ids
 }
 
-// GetDeadWorkerIDs returns the IDs of all workers that have stopped responding.
 func (m *MasterServer) GetDeadWorkerIDs() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()

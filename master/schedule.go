@@ -16,14 +16,11 @@ package main
 
 import "fmt"
 
-// ShardAssignment represents which worker is training on which data shard.
 type ShardAssignment struct {
 	WorkerID  string
 	ShardPath string
 }
 
-// GetShardAssignments returns a snapshot of all current shard assignments.
-// Used for status reporting and debugging.
 func (m *MasterServer) GetShardAssignments() []ShardAssignment {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -38,8 +35,6 @@ func (m *MasterServer) GetShardAssignments() []ShardAssignment {
 	return assignments
 }
 
-// reassignDeadWorkerShardsLocked gives each dead worker's shard to the first alive worker.
-// Caller must hold m.mu.
 func (m *MasterServer) reassignDeadWorkerShardsLocked() {
 	for id, w := range m.workers {
 		if w.IsAlive {
@@ -59,8 +54,6 @@ func (m *MasterServer) reassignDeadWorkerShardsLocked() {
 	}
 }
 
-// ReassignDeadWorkerShards takes shards from dead workers and gives them
-// to alive workers. Called during failure recovery.
 func (m *MasterServer) ReassignDeadWorkerShards() {
 	m.mu.Lock()
 	defer m.mu.Unlock()

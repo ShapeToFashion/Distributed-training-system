@@ -1,5 +1,0 @@
-Data parallelism replicates the model on each worker
-Each worker processes a different subset of the training data
-Synchronous SGD waits for all workers before updating weights
-Communication overhead is a bottleneck in distributed systems
-Model checkpointing saves progress during long training runs

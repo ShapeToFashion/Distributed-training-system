@@ -6,318 +6,31 @@
 # ──────────────────────────
 #   1. Go worker receives a task from master (shard path, batch size, learning rate)
 #   2. Go worker launches this script as a subprocess:
-#        python train.py --data=dataset/shard1.txt --batch_size=2 --lr=0.01 --weights=weights.json
+#        python train.py --data=dataset/train --batch_size=2 --lr=0.01 --weights=weights.json
 #   3. This script:
-#        a) Loads the data shard
-#        b) Loads current model weights
-#        c) Runs one training step (forward pass → loss → backward pass)
+#        a) Loads the ImageFolder dataset from data_path
+#        b) Loads current model weights (weights.json → state_dict)
+#        c) Runs one training batch (forward pass → loss → backward pass)
 #        d) Outputs gradients as JSON to stdout
 #   4. Go worker reads the JSON gradients and sends them to master via gRPC
 #
 # THE MODEL:
 # ──────────
-# We use a simple 2-layer neural network (not a full transformer yet).
-# This keeps training fast on CPU while still demonstrating real distributed training.
+# ResNet18 — a real CNN pretrained architecture (weights loaded from master).
+# Input: 224x224 RGB images (ImageFolder format)
+# Output: class logits → CrossEntropyLoss
 #
-#   Input (text) → Tokenize → Embedding → Linear Layer → Output → Loss
-#
-# The gradients are REAL mathematical gradients computed via backpropagation.
-# The master averages them across workers, which is EXACTLY how distributed
-# training works in PyTorch DDP, Horovod, etc.
+# Weight loading: weights.json (flat list) → reconstructed state_dict → model
+# Gradient extraction: state_dict key order → flat list → JSON stdout
 
 import argparse
 import json
 import sys
-import math
 import os
 
-# ──────────────────────────────────────────────────────────
-# TOKENIZER — converts text to numbers
-# ──────────────────────────────────────────────────────────
-# Real LLMs use BPE (Byte-Pair Encoding) tokenizers.
-# We use a simple character-level tokenizer for simplicity.
-# Each unique character gets a number (0-255).
-
-def tokenize(text, vocab_size=50):
-    """Convert text to list of integer token IDs."""
-    tokens = []
-    for ch in text:
-        tokens.append(ord(ch) % vocab_size)
-    return tokens
-
-
-# ──────────────────────────────────────────────────────────
-# MODEL — simple neural network with trainable weights
-# ──────────────────────────────────────────────────────────
-# Architecture:
-#   Input tokens → Embedding lookup → Hidden layer → Output → Loss
-#
-# Weight shapes:
-#   embedding:  [vocab_size x embed_dim]     — converts token IDs to vectors
-#   hidden_w:   [embed_dim x hidden_dim]     — first linear layer
-#   hidden_b:   [hidden_dim]                 — bias
-#   output_w:   [hidden_dim x vocab_size]    — predicts next token
-#   output_b:   [vocab_size]                 — bias
-
-class SimpleModel:
-    def __init__(self, vocab_size=50, embed_dim=16, hidden_dim=32):
-        self.vocab_size = vocab_size
-        self.embed_dim = embed_dim
-        self.hidden_dim = hidden_dim
-
-        # Initialize weights (small random-like values using a simple seed)
-        self.weights = self._init_weights()
-
-    def _init_weights(self):
-        """Create initial weight vector. All model parameters flattened into one list."""
-        # Total parameters:
-        #   embedding:  vocab_size * embed_dim     = 50 * 16 = 800
-        #   hidden_w:   embed_dim * hidden_dim     = 16 * 32 = 512
-        #   hidden_b:   hidden_dim                 = 32
-        #   output_w:   hidden_dim * vocab_size    = 32 * 50 = 1600
-        #   output_b:   vocab_size                 = 50
-        #   TOTAL = 2994 parameters
-        total = (self.vocab_size * self.embed_dim +
-                 self.embed_dim * self.hidden_dim +
-                 self.hidden_dim +
-                 self.hidden_dim * self.vocab_size +
-                 self.vocab_size)
-
-        # Initialize with small values (Xavier-like initialization)
-        weights = []
-        for i in range(total):
-            # Deterministic pseudo-random initialization
-            val = math.sin(i * 0.01) * 0.1
-            weights.append(val)
-        return weights
-
-    def load_weights(self, weights):
-        """Load weights from a flat list (received from master)."""
-        self.weights = weights[:]
-
-    def get_weight_count(self):
-        """Return total number of trainable parameters."""
-        return len(self.weights)
-
-    def _get_embedding(self):
-        """Extract embedding matrix from flat weight vector."""
-        size = self.vocab_size * self.embed_dim
-        flat = self.weights[:size]
-        # Reshape to [vocab_size][embed_dim]
-        matrix = []
-        for i in range(self.vocab_size):
-            row = flat[i * self.embed_dim:(i + 1) * self.embed_dim]
-            matrix.append(row)
-        return matrix
-
-    def _get_hidden(self):
-        """Extract hidden layer weights and bias."""
-        offset = self.vocab_size * self.embed_dim
-        w_size = self.embed_dim * self.hidden_dim
-        flat_w = self.weights[offset:offset + w_size]
-        offset += w_size
-        bias = self.weights[offset:offset + self.hidden_dim]
-
-        # Reshape W to [embed_dim][hidden_dim]
-        matrix = []
-        for i in range(self.embed_dim):
-            row = flat_w[i * self.hidden_dim:(i + 1) * self.hidden_dim]
-            matrix.append(row)
-        return matrix, bias
-
-    def _get_output(self):
-        """Extract output layer weights and bias."""
-        offset = (self.vocab_size * self.embed_dim +
-                  self.embed_dim * self.hidden_dim +
-                  self.hidden_dim)
-        w_size = self.hidden_dim * self.vocab_size
-        flat_w = self.weights[offset:offset + w_size]
-        offset += w_size
-        bias = self.weights[offset:offset + self.vocab_size]
-
-        # Reshape to [hidden_dim][vocab_size]
-        matrix = []
-        for i in range(self.hidden_dim):
-            row = flat_w[i * self.vocab_size:(i + 1) * self.vocab_size]
-            matrix.append(row)
-        return matrix, bias
-
-    def forward(self, tokens):
-        """
-        Forward pass: tokens → embedding → hidden → output → loss
-
-        Returns: (loss, cache)
-        cache stores intermediate values needed for backpropagation.
-        """
-        if len(tokens) < 2:
-            return 0.0, None
-
-        embedding = self._get_embedding()
-        hidden_w, hidden_b = self._get_hidden()
-        output_w, output_b = self._get_output()
-
-        total_loss = 0.0
-        count = 0
-        cache = {
-            'tokens': tokens,
-            'embeds': [],
-            'hiddens': [],
-            'hidden_pre_relu': [],
-            'logits_list': [],
-        }
-
-        # Process each pair of consecutive tokens (input → predict next)
-        for t in range(len(tokens) - 1):
-            input_token = tokens[t]
-            target_token = tokens[t + 1]
-
-            # Step 1: Embedding lookup
-            embed = embedding[input_token][:]
-            cache['embeds'].append(embed)
-
-            # Step 2: Hidden layer — h = ReLU(embed @ hidden_w + hidden_b)
-            hidden_pre = [0.0] * self.hidden_dim
-            for j in range(self.hidden_dim):
-                s = hidden_b[j]
-                for k in range(self.embed_dim):
-                    s += embed[k] * hidden_w[k][j]
-                hidden_pre[j] = s
-
-            cache['hidden_pre_relu'].append(hidden_pre[:])
-
-            # ReLU activation: max(0, x)
-            hidden = [max(0.0, x) for x in hidden_pre]
-            cache['hiddens'].append(hidden)
-
-            # Step 3: Output layer — logits = hidden @ output_w + output_b
-            logits = [0.0] * self.vocab_size
-            for j in range(self.vocab_size):
-                s = output_b[j]
-                for k in range(self.hidden_dim):
-                    s += hidden[k] * output_w[k][j]
-                logits[j] = s
-
-            cache['logits_list'].append(logits)
-
-            # Step 4: Softmax + Cross-entropy loss
-            # Softmax converts logits to probabilities
-            max_logit = max(logits)
-            exp_logits = [math.exp(l - max_logit) for l in logits]
-            sum_exp = sum(exp_logits)
-            probs = [e / sum_exp for e in exp_logits]
-
-            # Cross-entropy loss: -log(probability of correct token)
-            loss = -math.log(max(probs[target_token], 1e-10))
-            total_loss += loss
-            count += 1
-
-        avg_loss = total_loss / max(count, 1)
-        return avg_loss, cache
-
-    def backward(self, cache):
-        """
-        Backward pass: compute gradients of loss with respect to all weights.
-
-        This is BACKPROPAGATION — the core algorithm of deep learning.
-        We compute d(loss)/d(weight) for every weight in the model.
-
-        Returns: flat list of gradients (same length as self.weights)
-        """
-        tokens = cache['tokens']
-        embedding = self._get_embedding()
-        hidden_w, hidden_b = self._get_hidden()
-        output_w, output_b = self._get_output()
-
-        # Initialize gradient accumulators (zeros)
-        grad_embedding = [[0.0] * self.embed_dim for _ in range(self.vocab_size)]
-        grad_hidden_w = [[0.0] * self.hidden_dim for _ in range(self.embed_dim)]
-        grad_hidden_b = [0.0] * self.hidden_dim
-        grad_output_w = [[0.0] * self.vocab_size for _ in range(self.hidden_dim)]
-        grad_output_b = [0.0] * self.vocab_size
-
-        num_steps = len(tokens) - 1
-
-        for t in range(num_steps):
-            target_token = tokens[t + 1]
-            input_token = tokens[t]
-            embed = cache['embeds'][t]
-            hidden = cache['hiddens'][t]
-            hidden_pre = cache['hidden_pre_relu'][t]
-            logits = cache['logits_list'][t]
-
-            # ── Softmax probabilities ──
-            max_logit = max(logits)
-            exp_logits = [math.exp(l - max_logit) for l in logits]
-            sum_exp = sum(exp_logits)
-            probs = [e / sum_exp for e in exp_logits]
-
-            # ── Gradient of loss w.r.t. logits ──
-            # d_loss/d_logits = probs - one_hot(target)
-            d_logits = probs[:]
-            d_logits[target_token] -= 1.0
-            # Average over steps
-            for j in range(self.vocab_size):
-                d_logits[j] /= num_steps
-
-            # ── Gradient of output layer ──
-            # logits = hidden @ output_w + output_b
-            for j in range(self.vocab_size):
-                grad_output_b[j] += d_logits[j]
-                for k in range(self.hidden_dim):
-                    grad_output_w[k][j] += hidden[k] * d_logits[j]
-
-            # ── Gradient flowing back to hidden ──
-            d_hidden = [0.0] * self.hidden_dim
-            for k in range(self.hidden_dim):
-                for j in range(self.vocab_size):
-                    d_hidden[k] += output_w[k][j] * d_logits[j]
-
-            # ── ReLU gradient ──
-            # d_relu/d_input = 1 if input > 0, else 0
-            d_hidden_pre = [0.0] * self.hidden_dim
-            for j in range(self.hidden_dim):
-                if hidden_pre[j] > 0:
-                    d_hidden_pre[j] = d_hidden[j]
-
-            # ── Gradient of hidden layer ──
-            # hidden_pre = embed @ hidden_w + hidden_b
-            for j in range(self.hidden_dim):
-                grad_hidden_b[j] += d_hidden_pre[j]
-                for k in range(self.embed_dim):
-                    grad_hidden_w[k][j] += embed[k] * d_hidden_pre[j]
-
-            # ── Gradient of embedding ──
-            d_embed = [0.0] * self.embed_dim
-            for k in range(self.embed_dim):
-                for j in range(self.hidden_dim):
-                    d_embed[k] += hidden_w[k][j] * d_hidden_pre[j]
-
-            for k in range(self.embed_dim):
-                grad_embedding[input_token][k] += d_embed[k]
-
-        # ── Flatten all gradients into a single vector ──
-        # Must match the same order as self.weights
-        gradients = []
-
-        # Embedding gradients
-        for i in range(self.vocab_size):
-            gradients.extend(grad_embedding[i])
-
-        # Hidden layer weight gradients
-        for i in range(self.embed_dim):
-            gradients.extend(grad_hidden_w[i])
-
-        # Hidden bias gradients
-        gradients.extend(grad_hidden_b)
-
-        # Output layer weight gradients
-        for i in range(self.hidden_dim):
-            gradients.extend(grad_output_w[i])
-
-        # Output bias gradients
-        gradients.extend(grad_output_b)
-
-        return gradients
+import torch
+import torch.nn as nn
+from torchvision import datasets, transforms, models
 
 
 # ──────────────────────────────────────────────────────────
@@ -326,58 +39,131 @@ class SimpleModel:
 
 def train_on_shard(data_path, batch_size, learning_rate, weights_path=None):
     """
-    Train the model on one data shard and return gradients.
+    Train ResNet18 on one ImageFolder shard and return gradients.
 
     Args:
-        data_path: Path to the text data file (e.g., dataset/shard1.txt)
-        batch_size: Number of text lines to process per batch
-        learning_rate: Not used here (master applies it), but logged
-        weights_path: Path to JSON file with current model weights from master
+        data_path:     Path to ImageFolder-format dataset directory
+                       (subdirs = class names, each subdir has images)
+        batch_size:    Number of images per training batch
+        learning_rate: Not applied here — master applies it during aggregation
+        weights_path:  Path to weights.json (flat list from master)
 
     Returns:
-        dict with 'gradients' (list of floats) and 'loss' (float)
+        dict with:
+            'gradients'      — flat list of floats (same order as state_dict)
+            'loss'           — scalar float
+            'num_parameters' — total trainable param count
     """
-    # Load training data
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[PYTHON] Using device: {device}", file=sys.stderr)
+
+    # ─── Load Dataset (ImageFolder) ───────────────────────────────────────────
+    # Expected structure:
+    #   data_path/
+    #     class_a/  img1.jpg  img2.jpg ...
+    #     class_b/  img1.jpg  img2.jpg ...
     if not os.path.exists(data_path):
-        return {"error": f"Data file not found: {data_path}", "gradients": [], "loss": 0.0}
+        return {"error": f"Dataset path not found: {data_path}", "gradients": [], "loss": 0.0}
 
-    with open(data_path, 'r', encoding='utf-8') as f:
-        lines = [line.strip() for line in f if line.strip()]
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),          # ResNet18 expects 224x224
+        transforms.ToTensor(),                  # [0,255] uint8 → [0.0,1.0] float
+        transforms.Normalize([0.5]*3, [0.5]*3) # Normalize to [-1, 1]
+    ])
 
-    # Create model
-    model = SimpleModel(vocab_size=50, embed_dim=16, hidden_dim=32)
+    dataset = datasets.ImageFolder(data_path, transform=transform)
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0   # Keep 0 for subprocess safety (Go launches this)
+    )
+    print(f"[PYTHON] Dataset: {len(dataset)} images, {len(dataset.classes)} classes: {dataset.classes}", file=sys.stderr)
 
-    # Load weights from master if provided
+    # ─── Load Model (ResNet18) ────────────────────────────────────────────────
+    # MUST match the architecture used in Colab / master
+    # fc layer replaced to match number of classes in this dataset
+    model = models.resnet18(pretrained=False)
+    model.fc = nn.Linear(model.fc.in_features, len(dataset.classes))
+    model = model.to(device)
+    model.train()
+
+    # ─── Load weights.json → reconstruct state_dict ───────────────────────────
+    # CRITICAL: iteration order of state_dict keys MUST be identical
+    # on every worker and on the master. Python 3.7+ dicts preserve
+    # insertion order; PyTorch state_dict() is stable across the same
+    # model definition. Do NOT sort or reorder keys here.
     if weights_path and os.path.exists(weights_path):
-        with open(weights_path, 'r') as f:
-            master_weights = json.load(f)
-        if len(master_weights) == model.get_weight_count():
-            model.load_weights(master_weights)
+        with open(weights_path, "r") as f:
+            flat = json.load(f)  # flat list of floats from master
 
-    # Tokenize all lines
-    all_tokens = []
-    for line in lines[:batch_size]:
-        tokens = tokenize(line)
-        if len(tokens) > 2:
-            all_tokens.extend(tokens)
+        state_dict = model.state_dict()
+        pointer = 0
 
-    if len(all_tokens) < 3:
-        return {"error": "Not enough tokens to train", "gradients": [], "loss": 0.0}
+        for key, target_tensor in state_dict.items():   # ← same order as master
+            numel = target_tensor.numel()
+            vals  = flat[pointer:pointer + numel]
 
-    # Forward pass — compute loss
-    loss, cache = model.forward(all_tokens)
+            if len(vals) < numel:
+                return {
+                    "error": f"weights.json too short at key '{key}': "
+                             f"need {numel}, got {len(vals)}",
+                    "gradients": [], "loss": 0.0
+                }
 
-    if cache is None:
-        return {"error": "Forward pass failed", "gradients": [], "loss": 0.0}
+            tensor = torch.tensor(vals, dtype=target_tensor.dtype) \
+                          .view(target_tensor.shape)
+            state_dict[key] = tensor
+            pointer += numel
 
-    # Backward pass — compute gradients
-    gradients = model.backward(cache)
+        if pointer != len(flat):
+            print(f"[PYTHON] WARNING: weights.json has {len(flat)-pointer} extra values", file=sys.stderr)
+
+        model.load_state_dict(state_dict)
+        print(f"[PYTHON] Loaded weights.json ({pointer} values consumed)", file=sys.stderr)
+    else:
+        print("[PYTHON] No weights.json found — using random init", file=sys.stderr)
+
+    # ─── Training — ONE batch only ────────────────────────────────────────────
+    # Workers compute gradients for one batch; master aggregates and updates.
+    criterion = nn.CrossEntropyLoss()
+    loss = None
+
+    for images, labels in loader:
+        images = images.to(device)
+        labels = labels.to(device)
+
+        outputs = model(images)          # Forward pass
+        loss    = criterion(outputs, labels)
+
+        model.zero_grad()                # Clear any stale gradients
+        loss.backward()                  # Backprop — populates param.grad
+        break                            # One batch per worker call
+
+    if loss is None:
+        return {"error": "DataLoader was empty — no batches found", "gradients": [], "loss": 0.0}
+
+    # ─── Extract gradients (ORDER = state_dict keys) ───────────────────────────
+    # Master must flatten weights in the SAME order when building weights.json.
+    gradients = []
+    params_by_name = dict(model.named_parameters())
+
+    for key, tensor in model.state_dict().items():
+        param = params_by_name.get(key)
+        if param is not None and param.grad is not None:
+            gradients.extend(param.grad.detach().cpu().view(-1).tolist())
+        else:
+            # For buffers or missing gradients, send zeros to keep alignment.
+            print(f"[PYTHON] WARNING: no grad for '{key}', sending zeros", file=sys.stderr)
+            gradients.extend([0.0] * tensor.numel())
+
+    print(f"[PYTHON] Gradient vector size: {len(gradients)}", file=sys.stderr)
+    print(f"[PYTHON] Loss: {loss.item():.6f}", file=sys.stderr)
 
     return {
-        "gradients": gradients,
-        "loss": round(loss, 6),
-        "num_tokens": len(all_tokens),
-        "num_parameters": model.get_weight_count(),
+        "gradients":      gradients,
+        "loss":           round(loss.item(), 6),
+        "num_parameters": sum(p.numel() for p in model.parameters()),
     }
 
 
@@ -386,21 +172,23 @@ def train_on_shard(data_path, batch_size, learning_rate, weights_path=None):
 # ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Distributed LLM Training Worker Script")
-    parser.add_argument("--data", required=True, help="Path to data shard file")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
-    parser.add_argument("--lr", type=float, default=0.01, help="Learning rate")
-    parser.add_argument("--weights", default="", help="Path to weights JSON file")
+    parser = argparse.ArgumentParser(description="Distributed CNN Training Worker Script")
+    parser.add_argument("--data",       required=True,          help="Path to dataset folder (ImageFolder format)")
+    parser.add_argument("--batch_size", type=int,  default=4,   help="Batch size")
+    parser.add_argument("--lr",         type=float, default=0.01, help="Learning rate")
+    parser.add_argument("--weights",    default="",             help="Path to weights JSON file")
     args = parser.parse_args()
 
-    # Print status to stderr (Go reads stdout for JSON only)
-    print(f"[PYTHON] Training on: {args.data}", file=sys.stderr)
-    print(f"[PYTHON] Batch size: {args.batch_size}, LR: {args.lr}", file=sys.stderr)
+    # Status to stderr — Go reads stdout for JSON only
+    print(f"[PYTHON] Data path:  {args.data}",       file=sys.stderr)
+    print(f"[PYTHON] Batch size: {args.batch_size}", file=sys.stderr)
+    print(f"[PYTHON] LR:         {args.lr}",         file=sys.stderr)
+    print(f"[PYTHON] Weights:    {args.weights or 'none'}", file=sys.stderr)
 
     result = train_on_shard(args.data, args.batch_size, args.lr, args.weights)
 
-    print(f"[PYTHON] Loss: {result.get('loss', 'N/A')}", file=sys.stderr)
-    print(f"[PYTHON] Tokens: {result.get('num_tokens', 0)}, Params: {result.get('num_parameters', 0)}", file=sys.stderr)
+    if "error" in result:
+        print(f"[PYTHON] ERROR: {result['error']}", file=sys.stderr)
 
-    # Output JSON to stdout — this is what Go reads
+    # JSON to stdout — this is what Go reads
     json.dump(result, sys.stdout)

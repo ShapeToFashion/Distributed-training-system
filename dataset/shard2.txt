@@ -1,5 +1,0 @@
-Transformers use attention mechanisms to process sequences
-Large language models are trained on massive text corpora
-Tokenization converts text into numerical representations
-Backpropagation computes gradients through the network
-Parallel computing accelerates deep learning workflows

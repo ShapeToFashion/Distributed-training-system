@@ -54,7 +54,6 @@ func pythonExecutable() string {
 type TrainResult struct {
 	Gradients     []float32 `json:"gradients"`
 	Loss          float64   `json:"loss"`
-	NumTokens     int       `json:"num_tokens"`
 	NumParameters int       `json:"num_parameters"`
 	Error         string    `json:"error"`
 }
@@ -69,7 +68,14 @@ func main() {
 	fmt.Printf("[WORKER %s] Starting up...\n", *workerID)
 
 	// ── Step 1: Connect to master ──
-	conn, err := grpc.NewClient(*masterAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(
+		*masterAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(1024*1024*200),
+			grpc.MaxCallSendMsgSize(1024*1024*200),
+		),
+	)
 	if err != nil {
 		log.Fatalf("[WORKER %s] Failed to connect: %v", *workerID, err)
 	}
@@ -184,6 +190,7 @@ func runPythonTrainer(shardPath string, batchSize int, lr float32, weightsFile s
 		fmt.Sprintf("--lr=%f", lr),
 		fmt.Sprintf("--weights=%s", weightsFile),
 	)
+	cmd.Stderr = os.Stderr
 
 	// Capture stdout (JSON result) and stderr (logs)
 	output, err := cmd.Output()

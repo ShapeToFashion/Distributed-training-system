@@ -122,6 +122,8 @@ message TaskResponse {
   bool has_task = 5;            // False if no task available (training done)
   string task_size = 6;         // small | medium | large
   float capacity_score = 7;     // Score used by scheduler for this task
+  int32 partition_index = 8;    // Worker's dataset partition index
+  int32 partition_count = 9;    // Total number of partitions/workers
 }
 
 message WorkerMetrics {

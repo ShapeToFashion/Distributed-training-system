@@ -123,6 +123,33 @@ cd Distributed-training-system
 go mod tidy
 ```
 
+### Python Environment (required for workers)
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision pillow
+```
+
+### Prepare local training paths
+
+The current master config uses `dataset/train`. If your dataset is class folders under `dataset/`, create a train view:
+
+```bash
+mkdir -p dataset/train
+ln -sfn ../apple dataset/train/apple
+ln -sfn ../hourglass dataset/train/hourglass
+ln -sfn ../inverted_triangle dataset/train/inverted_triangle
+ln -sfn ../pear dataset/train/pear
+ln -sfn ../rectangle dataset/train/rectangle
+```
+
+### Generate compatible `weights.json`
+
+```bash
+PATH="$(pwd)/.venv/bin:$PATH" python -c "import json, torch.nn as nn; from torchvision import models; m=models.resnet18(weights=None); m.fc=nn.Linear(m.fc.in_features,5); flat=[]; [flat.extend(t.detach().cpu().view(-1).tolist()) for _,t in m.state_dict().items()]; json.dump(flat, open('weights.json','w')); print('weights_len', len(flat))"
+```
+
 ### (Re)generate gRPC Code from Proto
 
 If you modify `proto/trainer.proto`, regenerate the Go bindings:
@@ -153,13 +180,13 @@ Master listens on **port 50051**.
 **Terminal 2 — Start Worker 1:**
 
 ```bash
-go run worker/worker.go worker/heartbeat.go -id=worker1
+PATH="$(pwd)/.venv/bin:$PATH" go run worker/worker.go worker/heartbeat.go -id=worker1
 ```
 
 **Terminal 3 — Start Worker 2:**
 
 ```bash
-go run worker/worker.go worker/heartbeat.go -id=worker2
+PATH="$(pwd)/.venv/bin:$PATH" go run worker/worker.go worker/heartbeat.go -id=worker2
 ```
 
 ---
@@ -205,13 +232,13 @@ go run worker/worker.go worker/heartbeat.go -id=worker2
 
 2. Connect worker to master:
    ```bash
-   go run worker/worker.go worker/heartbeat.go -id=worker1 -master=10.56.89.116:50051
+   PATH="$(pwd)/.venv/bin:$PATH" go run worker/worker.go worker/heartbeat.go -id=worker1 -master=10.56.89.116:50051
    ```
 
 ### Test Connection Only (without training)
 
 ```bash
-go run worker/worker.go worker/heartbeat.go -id=test-worker -master=10.56.89.116:50051 -test
+PATH="$(pwd)/.venv/bin:$PATH" go run worker/worker.go worker/heartbeat.go -id=test-worker -master=10.56.89.116:50051 -test
 ```
 
 This registers with the master and exits — useful to verify the gRPC link works.
@@ -244,24 +271,6 @@ Defined in `proto/trainer.proto`:
 | `protoc-gen-go: program not found` | Run `go install` commands above and add GOPATH/bin to PATH           |
 | `module not found` errors          | Run `go mod tidy` in the project root                                |
 | Workers disconnect                 | Check heartbeat logs; master marks workers dead after 15s of silence |
-
----
-
-## Development Progress
-
-- [x] Step 1: gRPC protocol definition
-- [x] Step 2: Master server
-- [x] Step 3: Worker node
-- [x] Step 4: Worker registration
-- [x] Step 5: Heartbeat system
-- [ ] Step 6: Dataset distribution
-- [ ] Step 7: Training execution
-- [ ] Step 8: Gradient aggregation
-- [ ] Step 9: Checkpointingeck master is running and IP/port are correct |
-| `context deadline exceeded` | Firewall may be blocking port 50051 |
-| `protoc-gen-go: program not found` | Run `go install` commands above and add GOPATH/bin to PATH |
-| `module not found` errors | Run `go mod tidy` in the project root |
-| Workers disconnect | Check heartbeat logs; master marks workers dead after 15s of silence |
 
 ---
 

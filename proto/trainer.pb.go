@@ -473,16 +473,18 @@ func (x *TaskRequest) GetMetrics() *WorkerMetrics {
 }
 
 type TaskResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ShardPath     string                 `protobuf:"bytes,1,opt,name=shard_path,json=shardPath,proto3" json:"shard_path,omitempty"`               // Path to the data shard file
-	BatchSize     int32                  `protobuf:"varint,2,opt,name=batch_size,json=batchSize,proto3" json:"batch_size,omitempty"`              // How many samples per training batch
-	LearningRate  float32                `protobuf:"fixed32,3,opt,name=learning_rate,json=learningRate,proto3" json:"learning_rate,omitempty"`    // Learning rate for gradient descent
-	Epoch         int32                  `protobuf:"varint,4,opt,name=epoch,proto3" json:"epoch,omitempty"`                                       // Current training epoch number
-	HasTask       bool                   `protobuf:"varint,5,opt,name=has_task,json=hasTask,proto3" json:"has_task,omitempty"`                    // False if no task available (training done)
-	TaskSize      string                 `protobuf:"bytes,6,opt,name=task_size,json=taskSize,proto3" json:"task_size,omitempty"`                  // small | medium | large
-	CapacityScore float32                `protobuf:"fixed32,7,opt,name=capacity_score,json=capacityScore,proto3" json:"capacity_score,omitempty"` // Score used by scheduler for this task
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	ShardPath      string                 `protobuf:"bytes,1,opt,name=shard_path,json=shardPath,proto3" json:"shard_path,omitempty"`                 // Path to the data shard file
+	BatchSize      int32                  `protobuf:"varint,2,opt,name=batch_size,json=batchSize,proto3" json:"batch_size,omitempty"`                // How many samples per training batch
+	LearningRate   float32                `protobuf:"fixed32,3,opt,name=learning_rate,json=learningRate,proto3" json:"learning_rate,omitempty"`      // Learning rate for gradient descent
+	Epoch          int32                  `protobuf:"varint,4,opt,name=epoch,proto3" json:"epoch,omitempty"`                                         // Current training epoch number
+	HasTask        bool                   `protobuf:"varint,5,opt,name=has_task,json=hasTask,proto3" json:"has_task,omitempty"`                      // False if no task available (training done)
+	TaskSize       string                 `protobuf:"bytes,6,opt,name=task_size,json=taskSize,proto3" json:"task_size,omitempty"`                    // small | medium | large
+	CapacityScore  float32                `protobuf:"fixed32,7,opt,name=capacity_score,json=capacityScore,proto3" json:"capacity_score,omitempty"`   // Score used by scheduler for this task
+	PartitionIndex int32                  `protobuf:"varint,8,opt,name=partition_index,json=partitionIndex,proto3" json:"partition_index,omitempty"` // Worker's dataset partition index
+	PartitionCount int32                  `protobuf:"varint,9,opt,name=partition_count,json=partitionCount,proto3" json:"partition_count,omitempty"` // Total number of partitions/workers
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *TaskResponse) Reset() {
@@ -560,6 +562,20 @@ func (x *TaskResponse) GetTaskSize() string {
 func (x *TaskResponse) GetCapacityScore() float32 {
 	if x != nil {
 		return x.CapacityScore
+	}
+	return 0
+}
+
+func (x *TaskResponse) GetPartitionIndex() int32 {
+	if x != nil {
+		return x.PartitionIndex
+	}
+	return 0
+}
+
+func (x *TaskResponse) GetPartitionCount() int32 {
+	if x != nil {
+		return x.PartitionCount
 	}
 	return 0
 }
@@ -762,7 +778,7 @@ const file_proto_trainer_proto_rawDesc = "" +
 	"\aweights\x18\x01 \x03(\x02R\aweights\"\\\n" +
 	"\vTaskRequest\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x120\n" +
-	"\ametrics\x18\x02 \x01(\v2\x16.trainer.WorkerMetricsR\ametrics\"\xe6\x01\n" +
+	"\ametrics\x18\x02 \x01(\v2\x16.trainer.WorkerMetricsR\ametrics\"\xb8\x02\n" +
 	"\fTaskResponse\x12\x1d\n" +
 	"\n" +
 	"shard_path\x18\x01 \x01(\tR\tshardPath\x12\x1d\n" +
@@ -772,7 +788,9 @@ const file_proto_trainer_proto_rawDesc = "" +
 	"\x05epoch\x18\x04 \x01(\x05R\x05epoch\x12\x19\n" +
 	"\bhas_task\x18\x05 \x01(\bR\ahasTask\x12\x1b\n" +
 	"\ttask_size\x18\x06 \x01(\tR\btaskSize\x12%\n" +
-	"\x0ecapacity_score\x18\a \x01(\x02R\rcapacityScore\"\xc1\x01\n" +
+	"\x0ecapacity_score\x18\a \x01(\x02R\rcapacityScore\x12'\n" +
+	"\x0fpartition_index\x18\b \x01(\x05R\x0epartitionIndex\x12'\n" +
+	"\x0fpartition_count\x18\t \x01(\x05R\x0epartitionCount\"\xc1\x01\n" +
 	"\rWorkerMetrics\x12\x1f\n" +
 	"\vcpu_percent\x18\x01 \x01(\x02R\n" +
 	"cpuPercent\x12\x1e\n" +

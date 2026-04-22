@@ -66,16 +66,21 @@ type MetricsTracker struct {
 	mu               sync.Mutex
 	throughput       float32
 	lastBatchSeconds float32
+	lastCPUIdle      uint64
+	lastCPUTotal     uint64
+	hasCPUSample     bool
 }
 
 func (m *MetricsTracker) Snapshot() *pb.WorkerMetrics {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	cpuPercent := m.readCPUPercentLocked()
+	gpuUtil, gpuMemFree := readGPUStats()
 	return &pb.WorkerMetrics{
-		CpuPercent:     0,
+		CpuPercent:     cpuPercent,
 		RamFreeGb:      readMemAvailableGB(),
-		GpuUtilPercent: 0,
-		GpuMemFreeGb:   0,
+		GpuUtilPercent: gpuUtil,
+		GpuMemFreeGb:   gpuMemFree,
 		Throughput:     m.throughput,
 	}
 }
@@ -117,6 +122,90 @@ func readMemAvailableGB() float32 {
 		return float32(kb / (1024 * 1024))
 	}
 	return 0
+}
+
+func (m *MetricsTracker) readCPUPercentLocked() float32 {
+	idle, total, ok := readCPUStat()
+	if !ok || total == 0 {
+		return 0
+	}
+	if !m.hasCPUSample {
+		m.lastCPUIdle = idle
+		m.lastCPUTotal = total
+		m.hasCPUSample = true
+		return 0
+	}
+	deltaIdle := idle - m.lastCPUIdle
+	deltaTotal := total - m.lastCPUTotal
+	m.lastCPUIdle = idle
+	m.lastCPUTotal = total
+	if deltaTotal == 0 {
+		return 0
+	}
+	util := (1.0 - float64(deltaIdle)/float64(deltaTotal)) * 100.0
+	if util < 0 {
+		util = 0
+	}
+	if util > 100 {
+		util = 100
+	}
+	return float32(util)
+}
+
+func readCPUStat() (idle uint64, total uint64, ok bool) {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0, 0, false
+	}
+	lines := strings.Split(string(data), "\n")
+	if len(lines) == 0 {
+		return 0, 0, false
+	}
+	fields := strings.Fields(lines[0])
+	if len(fields) < 5 || fields[0] != "cpu" {
+		return 0, 0, false
+	}
+	var values []uint64
+	for _, f := range fields[1:] {
+		v, err := strconv.ParseUint(f, 10, 64)
+		if err != nil {
+			return 0, 0, false
+		}
+		values = append(values, v)
+		total += v
+	}
+	// idle + iowait
+	idle = values[3]
+	if len(values) > 4 {
+		idle += values[4]
+	}
+	return idle, total, true
+}
+
+func readGPUStats() (gpuUtilPercent float32, gpuMemFreeGB float32) {
+	cmd := exec.Command("nvidia-smi", "--query-gpu=utilization.gpu,memory.free", "--format=csv,noheader,nounits")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, 0
+	}
+	line := strings.TrimSpace(string(output))
+	if line == "" {
+		return 0, 0
+	}
+	first := strings.Split(line, "\n")[0]
+	parts := strings.Split(first, ",")
+	if len(parts) < 2 {
+		return 0, 0
+	}
+	util, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 32)
+	if err != nil {
+		return 0, 0
+	}
+	memMB, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err != nil {
+		return 0, 0
+	}
+	return float32(util), float32(memMB / 1024.0)
 }
 
 func main() {
@@ -179,12 +268,16 @@ func main() {
 		}
 
 		if !task.HasTask {
-			fmt.Printf("[WORKER %s] No more tasks — training complete!\n", *workerID)
-			break
+			// The master can temporarily withhold a task while stabilizing a round.
+			// Keep polling instead of exiting to avoid dropping a worker.
+			fmt.Printf("[WORKER %s] No task assigned right now — waiting for next scheduling round...\n", *workerID)
+			time.Sleep(2 * time.Second)
+			continue
 		}
 
-		fmt.Printf("[WORKER %s] Got task: shard=%s, size=%s, batch=%d, score=%.3f, lr=%.4f, epoch=%d\n",
-			*workerID, task.ShardPath, task.TaskSize, task.BatchSize, task.CapacityScore, task.LearningRate, task.Epoch)
+		fmt.Printf("[WORKER %s] Got task: shard=%s, size=%s, batch=%d, score=%.3f, part=%d/%d, lr=%.4f, epoch=%d\n",
+			*workerID, task.ShardPath, task.TaskSize, task.BatchSize, task.CapacityScore,
+			task.PartitionIndex, task.PartitionCount, task.LearningRate, task.Epoch)
 
 		// 4b) Get latest weights from master
 		weightsResp, err := client.GetWeights(context.Background(), &pb.WeightsRequest{})
@@ -209,7 +302,14 @@ func main() {
 		// 4d) Run Python training script
 		fmt.Printf("[WORKER %s] Launching Python trainer...\n", *workerID)
 		stepStart := time.Now()
-		gradients, loss, err := runPythonTrainer(task.ShardPath, int(task.BatchSize), task.LearningRate, weightsFile)
+		gradients, loss, err := runPythonTrainer(
+			task.ShardPath,
+			int(task.BatchSize),
+			task.LearningRate,
+			weightsFile,
+			int(task.PartitionIndex),
+			int(task.PartitionCount),
+		)
 		if err != nil {
 			fmt.Printf("[WORKER %s] Python training error: %v\n", *workerID, err)
 			time.Sleep(2 * time.Second)
@@ -246,7 +346,7 @@ func main() {
 //
 // Communication: Go writes weights to a JSON file, Python reads them,
 // trains, and writes gradients as JSON to stdout.
-func runPythonTrainer(shardPath string, batchSize int, lr float32, weightsFile string) ([]float32, float64, error) {
+func runPythonTrainer(shardPath string, batchSize int, lr float32, weightsFile string, partitionIndex int, partitionCount int) ([]float32, float64, error) {
 	cmd := exec.Command(
 		pythonExecutable(),
 		"training/train.py",
@@ -254,6 +354,8 @@ func runPythonTrainer(shardPath string, batchSize int, lr float32, weightsFile s
 		fmt.Sprintf("--batch_size=%d", batchSize),
 		fmt.Sprintf("--lr=%f", lr),
 		fmt.Sprintf("--weights=%s", weightsFile),
+		fmt.Sprintf("--partition_index=%d", partitionIndex),
+		fmt.Sprintf("--partition_count=%d", partitionCount),
 	)
 	cmd.Stderr = os.Stderr
 

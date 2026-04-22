@@ -37,7 +37,7 @@ from torchvision import datasets, transforms, models
 # TRAINING FUNCTION — called by the Go worker
 # ──────────────────────────────────────────────────────────
 
-def train_on_shard(data_path, batch_size, learning_rate, weights_path=None):
+def train_on_shard(data_path, batch_size, learning_rate, weights_path=None, partition_index=0, partition_count=1):
     """
     Train ResNet18 on one ImageFolder shard and return gradients.
 
@@ -71,20 +71,40 @@ def train_on_shard(data_path, batch_size, learning_rate, weights_path=None):
         transforms.Normalize([0.5]*3, [0.5]*3) # Normalize to [-1, 1]
     ])
 
-    dataset = datasets.ImageFolder(data_path, transform=transform)
+    base_dataset = datasets.ImageFolder(data_path, transform=transform)
+    if partition_count <= 0:
+        partition_count = 1
+    if partition_index < 0:
+        partition_index = 0
+    if partition_index >= partition_count:
+        partition_index = partition_index % partition_count
+
+    # Ensure workers train on disjoint sample sets for the same epoch.
+    partitioned_indices = [i for i in range(len(base_dataset)) if (i % partition_count) == partition_index]
+    if not partitioned_indices:
+        return {
+            "error": f"No samples in partition {partition_index}/{partition_count}",
+            "gradients": [],
+            "loss": 0.0,
+        }
+    dataset = torch.utils.data.Subset(base_dataset, partitioned_indices)
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=0   # Keep 0 for subprocess safety (Go launches this)
     )
-    print(f"[PYTHON] Dataset: {len(dataset)} images, {len(dataset.classes)} classes: {dataset.classes}", file=sys.stderr)
+    print(
+        f"[PYTHON] Dataset: {len(dataset)} images in partition {partition_index}/{partition_count}, "
+        f"{len(base_dataset.classes)} classes: {base_dataset.classes}",
+        file=sys.stderr,
+    )
 
     # ─── Load Model (ResNet18) ────────────────────────────────────────────────
     # MUST match the architecture used in Colab / master
     # fc layer replaced to match number of classes in this dataset
     model = models.resnet18(pretrained=False)
-    model.fc = nn.Linear(model.fc.in_features, len(dataset.classes))
+    model.fc = nn.Linear(model.fc.in_features, len(base_dataset.classes))
     model = model.to(device)
     model.train()
 
@@ -177,6 +197,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int,  default=4,   help="Batch size")
     parser.add_argument("--lr",         type=float, default=0.01, help="Learning rate")
     parser.add_argument("--weights",    default="",             help="Path to weights JSON file")
+    parser.add_argument("--partition_index", type=int, default=0, help="Worker partition index")
+    parser.add_argument("--partition_count", type=int, default=1, help="Total worker partitions")
     args = parser.parse_args()
 
     # Status to stderr — Go reads stdout for JSON only
@@ -184,8 +206,16 @@ if __name__ == "__main__":
     print(f"[PYTHON] Batch size: {args.batch_size}", file=sys.stderr)
     print(f"[PYTHON] LR:         {args.lr}",         file=sys.stderr)
     print(f"[PYTHON] Weights:    {args.weights or 'none'}", file=sys.stderr)
+    print(f"[PYTHON] Partition:  {args.partition_index}/{args.partition_count}", file=sys.stderr)
 
-    result = train_on_shard(args.data, args.batch_size, args.lr, args.weights)
+    result = train_on_shard(
+        args.data,
+        args.batch_size,
+        args.lr,
+        args.weights,
+        args.partition_index,
+        args.partition_count,
+    )
 
     if "error" in result:
         print(f"[PYTHON] ERROR: {result['error']}", file=sys.stderr)

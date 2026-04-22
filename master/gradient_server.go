@@ -26,6 +26,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -71,6 +72,8 @@ type MasterServer struct {
 	trainingDone     bool
 	shardAssignments map[string]string
 	nextShardIndex   int
+	roundPartitions  map[string]int
+	roundPartCount   int
 }
 
 // ───────────── Load weights ─────────────
@@ -93,6 +96,7 @@ func NewMasterServer(config TrainingConfig, weights []float32) *MasterServer {
 		lossBuffer:       make(map[string]float64),
 		config:           config,
 		shardAssignments: make(map[string]string),
+		roundPartitions:  make(map[string]int),
 	}
 }
 
@@ -148,6 +152,11 @@ func (m *MasterServer) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.Ta
 
 	capacityScore := m.computeCapacityScoreLocked(req.WorkerId)
 	taskSize, batchSize := m.pickTaskSize(capacityScore)
+	partitionIndex, partitionCount, ok := m.workerPartitionLocked(req.WorkerId)
+	if !ok {
+		// New workers wait until next aggregation round so partitioning remains stable.
+		return &pb.TaskResponse{HasTask: false}, nil
+	}
 
 	fmt.Printf("[MASTER] Task for %s -> shard=%s size=%s batch=%d score=%.3f\n",
 		req.WorkerId, shard, taskSize, batchSize, capacityScore)
@@ -160,6 +169,8 @@ func (m *MasterServer) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.Ta
 		HasTask:      true,
 		TaskSize:     taskSize,
 		CapacityScore: float32(capacityScore),
+		PartitionIndex: int32(partitionIndex),
+		PartitionCount: int32(partitionCount),
 	}, nil
 }
 
@@ -168,12 +179,21 @@ func (m *MasterServer) SendGradients(ctx context.Context, req *pb.GradientReques
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if len(m.roundPartitions) > 0 {
+		if _, ok := m.roundPartitions[req.WorkerId]; !ok {
+			// Worker belongs to next round; ignore stale/out-of-round gradients.
+			return &pb.GradientResponse{Status: "waiting_next_round"}, nil
+		}
+	}
+
+	if _, exists := m.gradientBuffer[req.WorkerId]; !exists {
+		m.gradientCount++
+	}
 	m.gradientBuffer[req.WorkerId] = req.Gradients
 	m.lossBuffer[req.WorkerId] = req.Loss
-	m.gradientCount++
 	fmt.Printf("[MASTER] Received gradients from %s: grad_len=%d loss=%.6f\n", req.WorkerId, len(req.Gradients), req.Loss)
 
-	if m.gradientCount >= m.aliveWorkerCountLocked() {
+	if m.gradientCount >= m.expectedWorkersForRoundLocked() {
 		m.aggregateAndUpdate()
 	}
 
@@ -211,6 +231,8 @@ func (m *MasterServer) aggregateAndUpdate() {
 	m.gradientBuffer = make(map[string][]float32)
 	m.lossBuffer = make(map[string]float64)
 	m.gradientCount = 0
+	m.roundPartitions = make(map[string]int)
+	m.roundPartCount = 0
 
 	fmt.Println("[MASTER] Weights updated & saved")
 }
@@ -230,6 +252,13 @@ func (m *MasterServer) aliveWorkerCountLocked() int {
 		return 1
 	}
 	return count
+}
+
+func (m *MasterServer) expectedWorkersForRoundLocked() int {
+	if m.roundPartCount > 0 {
+		return m.roundPartCount
+	}
+	return m.aliveWorkerCountLocked()
 }
 
 func (m *MasterServer) pickNextShardLocked() string {
@@ -293,6 +322,27 @@ func clamp01(v float64) float64 {
 		return 1
 	}
 	return v
+}
+
+func (m *MasterServer) workerPartitionLocked(workerID string) (int, int, bool) {
+	if len(m.roundPartitions) == 0 {
+		var alive []string
+		for id, w := range m.workers {
+			if w.IsAlive {
+				alive = append(alive, id)
+			}
+		}
+		if len(alive) == 0 {
+			return 0, 1, false
+		}
+		sort.Strings(alive)
+		m.roundPartCount = len(alive)
+		for idx, id := range alive {
+			m.roundPartitions[id] = idx
+		}
+	}
+	idx, ok := m.roundPartitions[workerID]
+	return idx, m.roundPartCount, ok
 }
 
 // ───────────── Get Weights ─────────────

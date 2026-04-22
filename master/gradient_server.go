@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"sync"
@@ -40,6 +41,7 @@ type WorkerInfo struct {
 	LastHeartbeat time.Time
 	IsAlive       bool
 	AssignedShard string
+	Metrics       pb.WorkerMetrics
 }
 
 // ───────────── Config ─────────────
@@ -68,6 +70,7 @@ type MasterServer struct {
 	currentStep      int
 	trainingDone     bool
 	shardAssignments map[string]string
+	nextShardIndex   int
 }
 
 // ───────────── Load weights ─────────────
@@ -104,12 +107,7 @@ func (m *MasterServer) RegisterWorker(ctx context.Context, req *pb.RegisterReque
 		LastHeartbeat: time.Now(),
 		IsAlive:       true,
 	}
-
-	shardIndex := len(m.workers) % len(m.config.ShardPaths)
-	shard := m.config.ShardPaths[shardIndex]
-	m.shardAssignments[req.WorkerId] = shard
-
-	fmt.Printf("[MASTER] Assigned shard %s → %s\n", shard, req.WorkerId)
+	fmt.Printf("[MASTER] Registered worker: %s\n", req.WorkerId)
 	return &pb.RegisterResponse{Status: "registered"}, nil
 }
 
@@ -120,6 +118,9 @@ func (m *MasterServer) SendHeartbeat(ctx context.Context, req *pb.HeartbeatReque
 	if w, ok := m.workers[req.WorkerId]; ok {
 		w.LastHeartbeat = time.Now()
 		w.IsAlive = true
+		if req.Metrics != nil {
+			w.Metrics = *req.Metrics
+		}
 	}
 	return &pb.HeartbeatResponse{Status: "alive"}, nil
 }
@@ -131,16 +132,34 @@ func (m *MasterServer) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.Ta
 	if m.trainingDone {
 		return &pb.TaskResponse{HasTask: false}, nil
 	}
-	shard := m.shardAssignments[req.WorkerId]
+	worker, ok := m.workers[req.WorkerId]
+	if !ok || !worker.IsAlive {
+		return &pb.TaskResponse{HasTask: false}, nil
+	}
+	if req.Metrics != nil {
+		worker.Metrics = *req.Metrics
+	}
+
+	shard := m.pickNextShardLocked()
 	if shard == "" {
 		return &pb.TaskResponse{HasTask: false}, nil
 	}
+	worker.AssignedShard = shard
+
+	capacityScore := m.computeCapacityScoreLocked(req.WorkerId)
+	taskSize, batchSize := m.pickTaskSize(capacityScore)
+
+	fmt.Printf("[MASTER] Task for %s -> shard=%s size=%s batch=%d score=%.3f\n",
+		req.WorkerId, shard, taskSize, batchSize, capacityScore)
+
 	return &pb.TaskResponse{
 		ShardPath:    shard,
-		BatchSize:    int32(m.config.BatchSize),
+		BatchSize:    int32(batchSize),
 		LearningRate: m.config.LearningRate,
 		Epoch:        int32(m.currentEpoch),
 		HasTask:      true,
+		TaskSize:     taskSize,
+		CapacityScore: float32(capacityScore),
 	}, nil
 }
 
@@ -154,7 +173,7 @@ func (m *MasterServer) SendGradients(ctx context.Context, req *pb.GradientReques
 	m.gradientCount++
 	fmt.Printf("[MASTER] Received gradients from %s: grad_len=%d loss=%.6f\n", req.WorkerId, len(req.Gradients), req.Loss)
 
-	if m.gradientCount >= len(m.workers) {
+	if m.gradientCount >= m.aliveWorkerCountLocked() {
 		m.aggregateAndUpdate()
 	}
 
@@ -194,6 +213,86 @@ func (m *MasterServer) aggregateAndUpdate() {
 	m.gradientCount = 0
 
 	fmt.Println("[MASTER] Weights updated & saved")
+}
+
+func (m *MasterServer) aliveWorkerCountLocked() int {
+	count := 0
+	now := time.Now()
+	for _, w := range m.workers {
+		if now.Sub(w.LastHeartbeat) <= 15*time.Second {
+			w.IsAlive = true
+			count++
+			continue
+		}
+		w.IsAlive = false
+	}
+	if count == 0 {
+		return 1
+	}
+	return count
+}
+
+func (m *MasterServer) pickNextShardLocked() string {
+	if len(m.config.ShardPaths) == 0 {
+		return ""
+	}
+	shard := m.config.ShardPaths[m.nextShardIndex%len(m.config.ShardPaths)]
+	m.nextShardIndex++
+	return shard
+}
+
+func (m *MasterServer) computeCapacityScoreLocked(workerID string) float64 {
+	worker, ok := m.workers[workerID]
+	if !ok {
+		return 0
+	}
+	var maxThroughput float64 = 1
+	var maxMemory float64 = 1
+	var maxGPUHeadroom float64 = 1
+
+	for _, w := range m.workers {
+		if !w.IsAlive {
+			continue
+		}
+		maxThroughput = math.Max(maxThroughput, float64(w.Metrics.Throughput))
+		maxMemory = math.Max(maxMemory, float64(w.Metrics.RamFreeGb+w.Metrics.GpuMemFreeGb))
+		maxGPUHeadroom = math.Max(maxGPUHeadroom, float64(100.0-w.Metrics.GpuUtilPercent))
+	}
+
+	throughputNorm := float64(worker.Metrics.Throughput) / maxThroughput
+	memoryNorm := float64(worker.Metrics.RamFreeGb+worker.Metrics.GpuMemFreeGb) / maxMemory
+	gpuHeadroomNorm := float64(100.0-worker.Metrics.GpuUtilPercent) / maxGPUHeadroom
+
+	throughputNorm = clamp01(throughputNorm)
+	memoryNorm = clamp01(memoryNorm)
+	gpuHeadroomNorm = clamp01(gpuHeadroomNorm)
+
+	return 0.5*throughputNorm + 0.3*memoryNorm + 0.2*gpuHeadroomNorm
+}
+
+func (m *MasterServer) pickTaskSize(score float64) (string, int) {
+	baseBatch := m.config.BatchSize
+	if baseBatch <= 0 {
+		baseBatch = 1
+	}
+	switch {
+	case score >= 0.66:
+		return "large", baseBatch * 4
+	case score >= 0.33:
+		return "medium", baseBatch * 2
+	default:
+		return "small", baseBatch
+	}
+}
+
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
 }
 
 // ───────────── Get Weights ─────────────

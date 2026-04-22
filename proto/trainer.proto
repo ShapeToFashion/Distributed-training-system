@@ -78,6 +78,7 @@ message RegisterResponse {
 
 message HeartbeatRequest {
   string worker_id = 1;   // Which worker is sending the heartbeat
+  WorkerMetrics metrics = 2; // Latest worker capacity metrics
 }
 
 message HeartbeatResponse {
@@ -110,6 +111,7 @@ message WeightsResponse {
 
 message TaskRequest {
   string worker_id = 1;         // Which worker is asking for a task
+  WorkerMetrics metrics = 2;    // Worker-reported capacity metrics
 }
 
 message TaskResponse {
@@ -118,6 +120,16 @@ message TaskResponse {
   float learning_rate = 3;      // Learning rate for gradient descent
   int32 epoch = 4;              // Current training epoch number
   bool has_task = 5;            // False if no task available (training done)
+  string task_size = 6;         // small | medium | large
+  float capacity_score = 7;     // Score used by scheduler for this task
+}
+
+message WorkerMetrics {
+  float cpu_percent = 1;        // CPU utilization in [0,100]
+  float ram_free_gb = 2;        // Free RAM in GB
+  float gpu_util_percent = 3;   // GPU utilization in [0,100]
+  float gpu_mem_free_gb = 4;    // Free GPU memory in GB
+  float throughput = 5;         // Work rate (samples/sec)
 }
 
 // ── Checkpointing ──

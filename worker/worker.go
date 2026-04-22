@@ -29,9 +29,13 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	pb "distributed_llm/proto"
@@ -58,6 +62,63 @@ type TrainResult struct {
 	Error         string    `json:"error"`
 }
 
+type MetricsTracker struct {
+	mu               sync.Mutex
+	throughput       float32
+	lastBatchSeconds float32
+}
+
+func (m *MetricsTracker) Snapshot() *pb.WorkerMetrics {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return &pb.WorkerMetrics{
+		CpuPercent:     0,
+		RamFreeGb:      readMemAvailableGB(),
+		GpuUtilPercent: 0,
+		GpuMemFreeGb:   0,
+		Throughput:     m.throughput,
+	}
+}
+
+func (m *MetricsTracker) UpdateThroughput(samples int, elapsed time.Duration) {
+	if elapsed <= 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current := float32(float64(samples) / elapsed.Seconds())
+	if m.throughput == 0 {
+		m.throughput = current
+	} else {
+		// EWMA smoothing to reduce oscillation.
+		m.throughput = 0.7*m.throughput + 0.3*current
+	}
+	m.lastBatchSeconds = float32(elapsed.Seconds())
+}
+
+func readMemAvailableGB() float32 {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "MemAvailable:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0
+		}
+		kb, err := strconv.ParseFloat(fields[1], 64)
+		if err != nil {
+			return 0
+		}
+		return float32(kb / (1024 * 1024))
+	}
+	return 0
+}
+
 func main() {
 	// ── Parse command-line flags ──
 	workerID := flag.String("id", "worker1", "Unique worker ID")
@@ -82,6 +143,7 @@ func main() {
 	defer conn.Close()
 
 	client := pb.NewTrainerServiceClient(conn)
+	metrics := &MetricsTracker{}
 
 	// ── Step 2: Register with master ──
 	resp, err := client.RegisterWorker(context.Background(), &pb.RegisterRequest{
@@ -99,7 +161,7 @@ func main() {
 	}
 
 	// ── Step 3: Start heartbeat in background ──
-	go StartHeartbeat(client, *workerID)
+	go StartHeartbeat(client, *workerID, metrics.Snapshot)
 
 	// ── Step 4: Training loop ──
 	fmt.Printf("[WORKER %s] Entering training loop...\n", *workerID)
@@ -108,6 +170,7 @@ func main() {
 		// 4a) Ask master for a task
 		task, err := client.GetTask(context.Background(), &pb.TaskRequest{
 			WorkerId: *workerID,
+			Metrics:  metrics.Snapshot(),
 		})
 		if err != nil {
 			fmt.Printf("[WORKER %s] GetTask error: %v (retrying...)\n", *workerID, err)
@@ -120,8 +183,8 @@ func main() {
 			break
 		}
 
-		fmt.Printf("[WORKER %s] Got task: shard=%s, batch=%d, lr=%.4f, epoch=%d\n",
-			*workerID, task.ShardPath, task.BatchSize, task.LearningRate, task.Epoch)
+		fmt.Printf("[WORKER %s] Got task: shard=%s, size=%s, batch=%d, score=%.3f, lr=%.4f, epoch=%d\n",
+			*workerID, task.ShardPath, task.TaskSize, task.BatchSize, task.CapacityScore, task.LearningRate, task.Epoch)
 
 		// 4b) Get latest weights from master
 		weightsResp, err := client.GetWeights(context.Background(), &pb.WeightsRequest{})
@@ -145,12 +208,14 @@ func main() {
 
 		// 4d) Run Python training script
 		fmt.Printf("[WORKER %s] Launching Python trainer...\n", *workerID)
+		stepStart := time.Now()
 		gradients, loss, err := runPythonTrainer(task.ShardPath, int(task.BatchSize), task.LearningRate, weightsFile)
 		if err != nil {
 			fmt.Printf("[WORKER %s] Python training error: %v\n", *workerID, err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
+		metrics.UpdateThroughput(int(math.Max(1, float64(task.BatchSize))), time.Since(stepStart))
 
 		fmt.Printf("[WORKER %s] Training done — loss: %.6f, gradients: %d params\n",
 			*workerID, loss, len(gradients))

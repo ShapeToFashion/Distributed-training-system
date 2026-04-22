@@ -42,11 +42,16 @@ import (
 //
 // If the master is unreachable, the worker logs the error and keeps trying.
 // This is important because the master might restart.
-func StartHeartbeat(client pb.TrainerServiceClient, workerID string) {
+func StartHeartbeat(client pb.TrainerServiceClient, workerID string, metricsFn func() *pb.WorkerMetrics) {
 	for {
+		metrics := metricsFn()
+		if metrics == nil {
+			metrics = &pb.WorkerMetrics{}
+		}
 		// Send heartbeat to master
 		_, err := client.SendHeartbeat(context.Background(), &pb.HeartbeatRequest{
 			WorkerId: workerID,
+			Metrics:  metrics,
 		})
 
 		if err != nil {

@@ -1,3 +1,6 @@
 dataset/
 *.pth
 weights.json
+weights.json
+*.pth
+dataset/

@@ -80,11 +80,14 @@ type MasterServer struct {
 func loadWeights(path string) []float32 {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		panic(err)
+		fmt.Printf("[MASTER] weights.json not found — starting with empty weights (workers will use random init)\n")
+		return []float32{}
 	}
-
 	var weights []float32
-	json.Unmarshal(data, &weights)
+	if err := json.Unmarshal(data, &weights); err != nil {
+		fmt.Printf("[MASTER] Failed to parse weights.json: %v — starting with empty weights\n", err)
+		return []float32{}
+	}
 	return weights
 }
 

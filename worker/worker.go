@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,6 +44,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+// masterDefault is the hosted master address.
+// After running "fly deploy", replace this with your Fly.io TCP address.
+const masterDefault = "localhost:50051"
 
 func pythonExecutable() string {
 	if p, err := exec.LookPath("python3"); err == nil {
@@ -208,10 +213,31 @@ func readGPUStats() (gpuUtilPercent float32, gpuMemFreeGB float32) {
 	return float32(util), float32(memMB / 1024.0)
 }
 
+func generateWorkerID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "worker"
+	}
+	var b strings.Builder
+	for _, c := range strings.ToLower(host) {
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			b.WriteRune(c)
+		}
+	}
+	safe := b.String()
+	if safe == "" {
+		safe = "worker"
+	}
+	if len(safe) > 12 {
+		safe = safe[:12]
+	}
+	return fmt.Sprintf("%s-%04d", safe, rand.Intn(10000))
+}
+
 func main() {
 	// ── Parse command-line flags ──
-	workerID := flag.String("id", "worker1", "Unique worker ID")
-	masterAddr := flag.String("master", "localhost:50051", "Master server address")
+	workerID := flag.String("id", generateWorkerID(), "Unique worker ID")
+	masterAddr := flag.String("master", masterDefault, "Master server address")
 	testOnly := flag.Bool("test", false, "Only test connection, then exit")
 	flag.Parse()
 

@@ -244,7 +244,7 @@ func (m *MasterServer) aliveWorkerCountLocked() int {
 	count := 0
 	now := time.Now()
 	for _, w := range m.workers {
-		if now.Sub(w.LastHeartbeat) <= 15*time.Second {
+		if now.Sub(w.LastHeartbeat) <= 3*time.Minute {
 			w.IsAlive = true
 			count++
 			continue

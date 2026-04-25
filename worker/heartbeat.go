@@ -63,7 +63,7 @@ func StartHeartbeat(client pb.TrainerServiceClient, workerID string, metricsFn f
 		}
 
 		// Wait 5 seconds before next heartbeat
-		time.Sleep(5 * time.Second)
+		time.Sleep(60 * time.Second)
 	}
 }
 

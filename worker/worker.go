@@ -50,11 +50,17 @@ import (
 const masterDefault = "localhost:50051"
 
 func pythonExecutable() string {
-	if p, err := exec.LookPath("python3"); err == nil {
-		return p
+	candidates := []string{
+		".venv/Scripts/python", // Windows venv
+		".venv/bin/python",     // Linux/Mac venv
+		"python3",
+		"python",
+		"py",
 	}
-	if p, err := exec.LookPath("python"); err == nil {
-		return p
+	for _, c := range candidates {
+		if p, err := exec.LookPath(c); err == nil {
+			return p
+		}
 	}
 	return "python"
 }

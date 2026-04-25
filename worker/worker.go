@@ -43,6 +43,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	_ "google.golang.org/grpc/encoding/gzip"
 )
 
 // masterDefault is the hosted master address.
@@ -256,6 +257,7 @@ func main() {
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(1024*1024*200),
 			grpc.MaxCallSendMsgSize(1024*1024*200),
+			grpc.UseCompressor("gzip"),
 		),
 	)
 	if err != nil {
@@ -321,7 +323,7 @@ func main() {
 
 		// 4c) Save weights to temp file for Python to read
 		weightsFile := filepath.Join(os.TempDir(), fmt.Sprintf("weights_%s.json", *workerID))
-		weightsJSON, err := json.Marshal(weightsResp.Weights)
+		weightsJSON, err := json.Marshal(pb.UnpackF16(weightsResp.Weights))
 		if err != nil {
 			fmt.Printf("[WORKER %s] Failed to marshal weights: %v\n", *workerID, err)
 			continue
@@ -355,7 +357,7 @@ func main() {
 		// 4e) Send gradients to master
 		_, err = client.SendGradients(context.Background(), &pb.GradientRequest{
 			WorkerId:  *workerID,
-			Gradients: gradients,
+			Gradients: pb.PackInt8(gradients),
 			Loss:      loss,
 		})
 		if err != nil {

@@ -33,6 +33,7 @@ import (
 	pb "distributed_llm/proto"
 
 	"google.golang.org/grpc"
+	_ "google.golang.org/grpc/encoding/gzip"
 )
 
 // ───────────── Worker Info ─────────────
@@ -128,6 +129,7 @@ func (m *MasterServer) SendHeartbeat(ctx context.Context, req *pb.HeartbeatReque
 		if req.Metrics != nil {
 			w.Metrics = *req.Metrics
 		}
+		fmt.Printf("[MASTER] Heartbeat from %s at %s\n", req.WorkerId, time.Now().Format("15:04:05"))
 	}
 	return &pb.HeartbeatResponse{Status: "alive"}, nil
 }
@@ -192,7 +194,7 @@ func (m *MasterServer) SendGradients(ctx context.Context, req *pb.GradientReques
 	if _, exists := m.gradientBuffer[req.WorkerId]; !exists {
 		m.gradientCount++
 	}
-	m.gradientBuffer[req.WorkerId] = req.Gradients
+	m.gradientBuffer[req.WorkerId] = pb.UnpackInt8(req.Gradients)
 	m.lossBuffer[req.WorkerId] = req.Loss
 	fmt.Printf("[MASTER] Received gradients from %s: grad_len=%d loss=%.6f\n", req.WorkerId, len(req.Gradients), req.Loss)
 
@@ -350,7 +352,10 @@ func (m *MasterServer) workerPartitionLocked(workerID string) (int, int, bool) {
 
 // ───────────── Get Weights ─────────────
 func (m *MasterServer) GetWeights(ctx context.Context, req *pb.WeightsRequest) (*pb.WeightsResponse, error) {
-	return &pb.WeightsResponse{Weights: m.weights}, nil
+	m.mu.Lock()
+	packed := pb.PackF16(m.weights)
+	m.mu.Unlock()
+	return &pb.WeightsResponse{Weights: packed}, nil
 }
 
 // ───────────── Save Weights ─────────────

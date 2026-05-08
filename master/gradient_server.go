@@ -26,6 +26,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -62,6 +63,10 @@ type MasterServer struct {
 	mu      sync.Mutex
 	workers map[string]*WorkerInfo
 	weights []float32
+	root    string
+
+	lastHeartbeatLog map[string]time.Time
+	lastTaskLog      map[string]time.Time
 
 	gradientBuffer map[string][]float32
 	lossBuffer     map[string]float64
@@ -81,7 +86,7 @@ type MasterServer struct {
 func loadWeights(path string) []float32 {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Printf("[MASTER] weights.json not found — starting with empty weights (workers will use random init)\n")
+		fmt.Printf("[MASTER] weights.json not found — starting with empty weights\n")
 		return []float32{}
 	}
 	var weights []float32
@@ -92,10 +97,13 @@ func loadWeights(path string) []float32 {
 	return weights
 }
 
-func NewMasterServer(config TrainingConfig, weights []float32) *MasterServer {
+func NewMasterServer(root string, config TrainingConfig, weights []float32) *MasterServer {
 	return &MasterServer{
 		workers:          make(map[string]*WorkerInfo),
 		weights:          weights,
+		root:             root,
+		lastHeartbeatLog: make(map[string]time.Time),
+		lastTaskLog:      make(map[string]time.Time),
 		gradientBuffer:   make(map[string][]float32),
 		lossBuffer:       make(map[string]float64),
 		config:           config,
@@ -129,7 +137,12 @@ func (m *MasterServer) SendHeartbeat(ctx context.Context, req *pb.HeartbeatReque
 		if req.Metrics != nil {
 			w.Metrics = *req.Metrics
 		}
-		fmt.Printf("[MASTER] Heartbeat from %s at %s\n", req.WorkerId, time.Now().Format("15:04:05"))
+		// Avoid spam: log heartbeat at most once per minute per worker.
+		now := time.Now()
+		if last, ok := m.lastHeartbeatLog[req.WorkerId]; !ok || now.Sub(last) >= time.Minute {
+			m.lastHeartbeatLog[req.WorkerId] = now
+			fmt.Printf("[MASTER] Heartbeat from %s at %s\n", req.WorkerId, now.Format("15:04:05"))
+		}
 	}
 	return &pb.HeartbeatResponse{Status: "alive"}, nil
 }
@@ -163,8 +176,13 @@ func (m *MasterServer) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.Ta
 		return &pb.TaskResponse{HasTask: false}, nil
 	}
 
-	fmt.Printf("[MASTER] Task for %s -> shard=%s size=%s batch=%d score=%.3f\n",
-		req.WorkerId, shard, taskSize, batchSize, capacityScore)
+	// Avoid spam: workers poll GetTask frequently; log at most once per 10s per worker.
+	now := time.Now()
+	if last, ok := m.lastTaskLog[req.WorkerId]; !ok || now.Sub(last) >= 10*time.Second {
+		m.lastTaskLog[req.WorkerId] = now
+		fmt.Printf("[MASTER] Task for %s -> shard=%s size=%s batch=%d score=%.3f part=%d/%d epoch=%d\n",
+			req.WorkerId, shard, taskSize, batchSize, capacityScore, partitionIndex, partitionCount, m.currentEpoch)
+	}
 
 	return &pb.TaskResponse{
 		ShardPath:    shard,
@@ -191,10 +209,18 @@ func (m *MasterServer) SendGradients(ctx context.Context, req *pb.GradientReques
 		}
 	}
 
+	unpacked := pb.UnpackInt8(req.Gradients)
+
+	// If starting without weights.json, initialize weights length from first gradients.
+	// This keeps master/worker aligned instead of training on an empty weight vector.
+	if len(m.weights) == 0 && len(unpacked) > 0 {
+		m.weights = make([]float32, len(unpacked))
+	}
+
 	if _, exists := m.gradientBuffer[req.WorkerId]; !exists {
 		m.gradientCount++
 	}
-	m.gradientBuffer[req.WorkerId] = pb.UnpackInt8(req.Gradients)
+	m.gradientBuffer[req.WorkerId] = unpacked
 	m.lossBuffer[req.WorkerId] = req.Loss
 	fmt.Printf("[MASTER] Received gradients from %s: grad_len=%d loss=%.6f\n", req.WorkerId, len(req.Gradients), req.Loss)
 
@@ -231,7 +257,7 @@ func (m *MasterServer) aggregateAndUpdate() {
 	}
 
 	// SAVE UPDATED WEIGHTS
-	m.SaveWeightsToFile("weights.json")
+	m.SaveWeightsToFile(filepath.Join(m.root, "weights.json"))
 
 	m.gradientBuffer = make(map[string][]float32)
 	m.lossBuffer = make(map[string]float64)
@@ -366,19 +392,25 @@ func (m *MasterServer) SaveWeightsToFile(path string) {
 
 // ───────────── MAIN ─────────────
 func main() {
+	wd, _ := os.Getwd()
+	root := wd
+	// Best-effort: if `go.mod` exists in wd, treat it as root; otherwise still work relative to wd.
+	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
+		// no-op
+	}
 
 	config := TrainingConfig{
-		NumEpochs:    10,
+		NumEpochs:    20,
 		BatchSize:    4,
-		LearningRate: 0.001,
+		LearningRate: 0.01,
 		ShardPaths: []string{
-			"dataset/train",
+			"dataset",
 		},
 	}
 
-	weights := loadWeights("weights.json")
+	weights := loadWeights(filepath.Join(root, "weights.json"))
 
-	master := NewMasterServer(config, weights)
+	master := NewMasterServer(root, config, weights)
 
 	lis, err := net.Listen("tcp", ":50051")
 	if err != nil {

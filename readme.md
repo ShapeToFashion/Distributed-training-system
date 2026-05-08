@@ -1,103 +1,86 @@
-# Distributed LLM Training System
+# Distributed AI Training System
 
-A distributed system for training Large Language Models across multiple machines
-using data parallelism, gRPC communication, and synchronous gradient aggregation.
-
-## Architecture
-
-```
-                 ┌───────────────────┐
-                 │      MASTER       │
-                 │    (Go Server)    │
-                 │                   │
-                 │ Gradient Server   │
-                 │ Worker Manager    │
-                 │ Scheduler         │
-                 └─────────┬─────────┘
-                           │
-                     gRPC (port 50051)
-                           │
-        ┌──────────┬───────┴───┬──────────┐
-     Worker1    Worker2    Worker3    Worker4
-      (Go)       (Go)       (Go)       (Go)
-```
-
-## Project Structure
-
-```
-proto/              gRPC protocol definition
-  trainer.proto     Service + message definitions
-  trainer.pb.go     Auto-generated message code
-  trainer_grpc.pb.go Auto-generated service code
-
-master/             Master node (runs on one machine)
-  gradient_server.go Main entry point + gRPC handlers
-  worker_manager.go  Worker health monitoring helpers
-  schedule.go        Task scheduling logic
-
-worker/             Worker node (runs on each machine)
-  worker.go          Main entry point + registration
-  heartbeat.go       Heartbeat/keep-alive system
-
-training/           Python training scripts (Step 7)
-dataset/            Training data shards
-storage/            Model checkpoints (Step 9)
-```
+This project implements a distributed system for training an AI model. It consists of a central master server that coordinates tasks and a set of worker nodes that perform the actual training. The communication between the master and workers is handled via gRPC.
 
 ## Prerequisites
 
-### 1. Install Go
+- Go
+- Python 3
+- PyTorch
+- `bore` (for running workers on different networks)
 
-Download and install Go (1.25+): https://go.dev/dl/
+## Setup
 
-Verify:
+1.  **Clone the repository:**
+    ```bash
+    git clone <your-repo-url>
+    cd <your-repo-name>
+    ```
+
+2.  **Install Go dependencies:**
+    ```bash
+    go mod tidy
+    ```
+
+3.  **Create a Python virtual environment and install dependencies:**
+    ```bash
+    python -m venv .venv
+    # Activate the environment
+    # On Windows (PowerShell):
+    .venv\Scripts\Activate.ps1
+    # On macOS/Linux:
+    # source .venv/bin/activate
+
+    pip install -r training/requirements.txt
+    ```
+
+## Running the System
+
+### 1. Start the Master Server
+
+Open a terminal in the project root and run:
 
 ```bash
-go version
+go run master/gradient_server.go master/worker_manager.go master/schedule.go
 ```
 
-### 2. Install Protocol Buffers Compiler (protoc)
+The master server will start and listen for worker connections on `localhost:50051`.
 
-**Windows:**
+### 2. Running a Local Worker
+
+To run a worker on the same machine as the master, open a **new** terminal (and activate the Python virtual environment) and run:
 
 ```bash
-# Using Chocolatey
-choco install protobuf
-
-# OR download manually from:
-# https://github.com/protocolbuffers/protobuf/releases
-# Add protoc.exe to your PATH
+go run worker/worker.go worker/heartbeat.go -id=local-worker-1
 ```
 
-**macOS:**
+You can run multiple local workers by providing a different `-id` for each one.
 
-```bash
-brew install protobuf
-```
+### 3. Running a Worker on a Different Network
 
-**Linux (Ubuntu/Debian):**
+To connect workers from external networks, you need to expose your master server to the internet. We use a tool called `bore` for this.
 
-```bash
-sudo apt install -y protobuf-compiler
-```
+**A. Expose the Master Server:**
 
-Verify:
+1.  Download and extract `bore`.
+2.  Open a **new** terminal and run the following command to create a public tunnel to your local master server on port `50051`:
+    ```bash
+    # Replace <path-to-bore> with the actual path to the executable
+    <path-to-bore>\bore.exe local 50051 --to bore.pub
+    ```
+3.  `bore` will output a public address, for example: `listening at bore.pub:12345`. Note this address.
 
-```bash
-protoc --version
-```
+**B. Start the Remote Worker:**
 
-### 3. Install Go gRPC Plugins
+1.  On the other computer, make sure you have the project code and all dependencies installed.
+2.  Open a terminal and run the worker, pointing it to the public address from the previous step:
+    ```bash
+    # Replace bore.pub:12345 with the actual address from your bore terminal
+    go run worker/worker.go worker/heartbeat.go -id=internet-worker -master=bore.pub:12345
+    ```
 
-```bash
-go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
-```
+**Important:** For the remote worker to function, you must keep the terminals for the **master server** and the **`bore` tunnel** running on your main computer.
 
-Make sure `$GOPATH/bin` (or `%GOPATH%\bin` on Windows) is in your PATH:
-
-```bash
-# Linux/macOS — add to ~/.bashrc or ~/.zshrc
 export PATH="$PATH:$(go env GOPATH)/bin"
 
 # Windows (PowerShell)

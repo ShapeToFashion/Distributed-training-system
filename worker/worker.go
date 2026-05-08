@@ -34,6 +34,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,19 +51,68 @@ import (
 // After running "fly deploy", replace this with your Fly.io TCP address.
 const masterDefault = "localhost:50051"
 
-func pythonExecutable() string {
-	candidates := []string{
-		".venv/Scripts/python", // Windows venv
-		".venv/bin/python",     // Linux/Mac venv
-		"python3",
-		"python",
-		"py",
+func findProjectRoot(start string) (string, bool) {
+	dir := start
+	for {
+		if dir == "" || dir == "." {
+			return "", false
+		}
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", false
+		}
+		dir = parent
 	}
+}
+
+func resolveProjectRoot(explicit string) string {
+	if explicit != "" {
+		if abs, err := filepath.Abs(explicit); err == nil {
+			return abs
+		}
+		return explicit
+	}
+	wd, err := os.Getwd()
+	if err == nil {
+		if root, ok := findProjectRoot(wd); ok {
+			return root
+		}
+	}
+	// Fall back to current directory.
+	return "."
+}
+
+func pythonExecutable() string {
+	// Prefer an interpreter that can import torch/torchvision, since `training/train.py`
+	// depends on them. This also avoids accidentally picking a local `.venv` python
+	// that exists but doesn't have the required packages.
+	candidates := []string{
+		"python",
+		"python3",
+		"py",
+		".venv/Scripts/python", // Windows venv (if it has deps)
+		".venv/bin/python",     // Linux/Mac venv (if it has deps)
+	}
+
 	for _, c := range candidates {
-		if p, err := exec.LookPath(c); err == nil {
+		p, err := exec.LookPath(c)
+		if err != nil {
+			continue
+		}
+
+		// Verify imports quickly.
+		cmd := exec.Command(p, "-c", "import torch, torchvision")
+		cmd.Stdout = nil
+		cmd.Stderr = nil
+		if err := cmd.Run(); err == nil {
 			return p
 		}
 	}
+
+	// Fallback (will likely error in runPythonTrainer with a useful message).
 	return "python"
 }
 
@@ -114,6 +164,9 @@ func (m *MetricsTracker) UpdateThroughput(samples int, elapsed time.Duration) {
 }
 
 func readMemAvailableGB() float32 {
+	if runtime.GOOS != "linux" {
+		return 0
+	}
 	data, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
 		return 0
@@ -165,6 +218,9 @@ func (m *MetricsTracker) readCPUPercentLocked() float32 {
 }
 
 func readCPUStat() (idle uint64, total uint64, ok bool) {
+	if runtime.GOOS != "linux" {
+		return 0, 0, false
+	}
 	data, err := os.ReadFile("/proc/stat")
 	if err != nil {
 		return 0, 0, false
@@ -245,8 +301,11 @@ func main() {
 	// ── Parse command-line flags ──
 	workerID := flag.String("id", generateWorkerID(), "Unique worker ID")
 	masterAddr := flag.String("master", masterDefault, "Master server address")
+	projectRootFlag := flag.String("root", "", "Project root (auto-detected via go.mod if empty)")
 	testOnly := flag.Bool("test", false, "Only test connection, then exit")
 	flag.Parse()
+
+	projectRoot := resolveProjectRoot(*projectRootFlag)
 
 	fmt.Printf("[WORKER %s] Starting up...\n", *workerID)
 
@@ -289,6 +348,8 @@ func main() {
 	// ── Step 4: Training loop ──
 	fmt.Printf("[WORKER %s] Entering training loop...\n", *workerID)
 
+	noTaskCount := 0
+
 	for {
 		// 4a) Ask master for a task
 		task, err := client.GetTask(context.Background(), &pb.TaskRequest{
@@ -304,10 +365,15 @@ func main() {
 		if !task.HasTask {
 			// The master can temporarily withhold a task while stabilizing a round.
 			// Keep polling instead of exiting to avoid dropping a worker.
-			fmt.Printf("[WORKER %s] No task assigned right now — waiting for next scheduling round...\n", *workerID)
+			noTaskCount++
+			// Avoid log spam: print every 10th "no task".
+			if noTaskCount%10 == 1 {
+				fmt.Printf("[WORKER %s] No task assigned right now — waiting...\n", *workerID)
+			}
 			time.Sleep(2 * time.Second)
 			continue
 		}
+		noTaskCount = 0
 
 		fmt.Printf("[WORKER %s] Got task: shard=%s, size=%s, batch=%d, score=%.3f, part=%d/%d, lr=%.4f, epoch=%d\n",
 			*workerID, task.ShardPath, task.TaskSize, task.BatchSize, task.CapacityScore,
@@ -337,6 +403,7 @@ func main() {
 		fmt.Printf("[WORKER %s] Launching Python trainer...\n", *workerID)
 		stepStart := time.Now()
 		gradients, loss, err := runPythonTrainer(
+			projectRoot,
 			task.ShardPath,
 			int(task.BatchSize),
 			task.LearningRate,
@@ -380,17 +447,24 @@ func main() {
 //
 // Communication: Go writes weights to a JSON file, Python reads them,
 // trains, and writes gradients as JSON to stdout.
-func runPythonTrainer(shardPath string, batchSize int, lr float32, weightsFile string, partitionIndex int, partitionCount int) ([]float32, float64, error) {
+func runPythonTrainer(projectRoot string, shardPath string, batchSize int, lr float32, weightsFile string, partitionIndex int, partitionCount int) ([]float32, float64, error) {
+	scriptPath := filepath.Join(projectRoot, "training", "train.py")
+	dataPath := shardPath
+	if !filepath.IsAbs(dataPath) {
+		dataPath = filepath.Join(projectRoot, dataPath)
+	}
+
 	cmd := exec.Command(
 		pythonExecutable(),
-		"training/train.py",
-		fmt.Sprintf("--data=%s", shardPath),
+		scriptPath,
+		fmt.Sprintf("--data=%s", dataPath),
 		fmt.Sprintf("--batch_size=%d", batchSize),
 		fmt.Sprintf("--lr=%f", lr),
 		fmt.Sprintf("--weights=%s", weightsFile),
 		fmt.Sprintf("--partition_index=%d", partitionIndex),
 		fmt.Sprintf("--partition_count=%d", partitionCount),
 	)
+	cmd.Dir = projectRoot
 	cmd.Stderr = os.Stderr
 
 	// Capture stdout (JSON result) and stderr (logs)

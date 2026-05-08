@@ -318,8 +318,12 @@ func main() {
 	} else {
 		transportCreds = insecure.NewCredentials()
 	}
+	dialAddr := *masterAddr
+	if *useTLS {
+		dialAddr = "passthrough:///" + *masterAddr
+	}
 	conn, err := grpc.NewClient(
-		*masterAddr,
+		dialAddr,
 		grpc.WithTransportCredentials(transportCreds),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(1024*1024*200),

@@ -43,6 +43,7 @@ import (
 	pb "distributed_llm/proto"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	_ "google.golang.org/grpc/encoding/gzip"
 )
@@ -303,6 +304,7 @@ func main() {
 	masterAddr := flag.String("master", masterDefault, "Master server address")
 	projectRootFlag := flag.String("root", "", "Project root (auto-detected via go.mod if empty)")
 	testOnly := flag.Bool("test", false, "Only test connection, then exit")
+	useTLS := flag.Bool("tls", false, "Use TLS (required for GitHub Codespaces / HTTPS endpoints)")
 	flag.Parse()
 
 	projectRoot := resolveProjectRoot(*projectRootFlag)
@@ -310,9 +312,15 @@ func main() {
 	fmt.Printf("[WORKER %s] Starting up...\n", *workerID)
 
 	// ── Step 1: Connect to master ──
+	var transportCreds credentials.TransportCredentials
+	if *useTLS {
+		transportCreds = credentials.NewClientTLSFromCert(nil, "")
+	} else {
+		transportCreds = insecure.NewCredentials()
+	}
 	conn, err := grpc.NewClient(
 		*masterAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(transportCreds),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(1024*1024*200),
 			grpc.MaxCallSendMsgSize(1024*1024*200),
